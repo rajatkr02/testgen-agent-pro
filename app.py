@@ -372,4 +372,4 @@ elif role == "Teacher Analytics & Reports":
             with st.expander(f"👤 Student: {s_name} | Set: {s_set} | Score: {score}/{t_marks} | Submitted: {s_time}"):
                 st.metric(label="Percentage", value=f"{(score/t_marks)*100:.2f}%" if t_marks > 0 else "0%")
                 st.markdown("### 🤖 Agentic Evaluation Audit & Feedback")
-                
+                st.markdown(report)
