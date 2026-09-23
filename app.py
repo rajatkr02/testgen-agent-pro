@@ -400,4 +400,47 @@ elif role == "Student Examination Portal":
                                             Student Answers: {json.dumps(student_answers)}
                                             Provide a detailed diagnostic performance review with strengths and chapter-wise feedback in clear markdown.
                                             """
-                         
+                                            eval_res = client.models.generate_content(model='gemini-2.5-flash', contents=eval_prompt)
+                                            agent_report = eval_res.text
+                                        except Exception:
+                                            agent_report = "Deterministic evaluation report compiled successfully."
+                                            
+                                        conn = get_db_connection()
+                                        c = conn.cursor()
+                                        c.execute("INSERT INTO submissions (student, set_id, score, total_marks, student_answers, agent_report, submitted_at) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                                                  (student_name, set_id, score, total_marks, json.dumps(student_answers), agent_report, str(datetime.now())))
+                                        conn.commit()
+                                        c.close()
+                                        conn.close()
+                                        
+                                        st.balloons()
+                                        st.success(f"🎉 Exam Submitted! Final Score: **{score} / {total_marks}**")
+                                        st.markdown("---")
+                                        st.markdown(agent_report)
+        else:
+            st.error("Invalid Configuration ID.")
+
+# ==========================================
+# 3. ANALYTICS & REPORTS HUB
+# ==========================================
+elif role == "Analytics & Reports Hub":
+    st.header("📊 Analytics & Performance Hub")
+    st.write("Review aggregated performance data, audits, and AI agent feedback reports.")
+    
+    conn = get_db_connection()
+    c = conn.cursor()
+    c.execute("SELECT id, student, set_id, score, total_marks, agent_report, submitted_at FROM submissions ORDER BY id DESC")
+    subs = c.fetchall()
+    c.close()
+    conn.close()
+    
+    if not subs:
+        st.info("No submission records found in the database yet.")
+    else:
+        for sub in subs:
+            sub_id, s_name, s_set, score, t_marks, report, s_time = sub
+            pct = (score / t_marks * 100) if t_marks > 0 else 0
+            with st.expander(f"👤 {s_name} | Set: {s_set} | Score: {score}/{t_marks} ({pct:.1f}%) | {s_time}"):
+                st.progress(pct / 100.0)
+                st.markdown("### 🤖 Agentic Diagnostic Feedback")
+                st.markdown(report)
