@@ -48,16 +48,20 @@ def get_db_connection():
 
 def init_db():
     conn = get_db_connection()
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS paper_configs 
-                 (config_id TEXT PRIMARY KEY, category TEXT, board_stream TEXT, grade TEXT, subject TEXT, matrix_data TEXT, num_sets INTEGER, exam_time TEXT, generated INT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS paper_sets 
-                 (set_id TEXT PRIMARY KEY, config_id TEXT, set_name TEXT, data TEXT, unlock_time TEXT, expires_at TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS submissions 
-                 (id SERIAL PRIMARY KEY, student TEXT, set_id TEXT, score REAL, total_marks REAL, student_answers TEXT, agent_report TEXT, submitted_at TEXT)''')
-    conn.commit()
-    c.close()
-    conn.close()
+    try:
+        c = conn.cursor()
+        c.execute('''CREATE TABLE IF NOT EXISTS paper_configs
+                     (config_id TEXT PRIMARY KEY, category TEXT, board_stream TEXT, grade TEXT, subject TEXT, matrix_data TEXT, num_sets INTEGER, exam_time TEXT, generated INT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS paper_sets
+                     (set_id TEXT PRIMARY KEY, config_id TEXT, set_name TEXT, data TEXT, unlock_time TEXT, expires_at TEXT)''')
+        c.execute('''CREATE TABLE IF NOT EXISTS submissions
+                     (id SERIAL PRIMARY KEY, student TEXT, set_id TEXT, score REAL, total_marks REAL, student_answers TEXT, agent_report TEXT, submitted_at TEXT)''')
+        conn.commit()
+        c.close()
+    except Exception as e:
+        st.error(f"Database Initialization Error: {e}")
+    finally:
+        conn.close()
 
 init_db()
 
@@ -76,46 +80,46 @@ with st.sidebar:
     st.markdown("---")
     st.info("💡 **Tip:** Use the Agentic Auto-Discover options in the Teacher Dashboard to fetch official syllabi instantly.")
 
-# --- HELPER FUNCTION: JIT GENERATION ---
-def run_jit_generation(config_id, api_key):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT category, board_stream, grade, subject, matrix_data, num_sets, exam_time FROM paper_configs WHERE config_id = ?", (config_id,))
-    # Note: Using parameterized SQL syntax compatible with psycopg2 placeholders (%s) or standard formats. 
-    # Let's adjust queries safely for PostgreSQL placeholders %s below.
-    pass
-
-# Safe PostgreSQL helper for fetching config
+# --- HELPER FUNCTION: FETCH CONFIG (PostgreSQL) ---
 def fetch_config(config_id):
     conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT category, board_stream, grade, subject, matrix_data, num_sets, exam_time, generated FROM paper_configs WHERE config_id = %s", (config_id,))
-    row = c.fetchone()
-    c.close()
-    conn.close()
-    return row
-
-def run_jit_generation_pg(config_id, api_key):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT category, board_stream, grade, subject, matrix_data, num_sets, exam_time FROM paper_configs WHERE config_id = %s", (config_id,))
-    config_row = c.fetchone()
-    
-    if not config_row:
-        conn.close()
-        return False, "Config ID not found."
-        
-    cat, b_stream, grd, subj, matrix_json, n_sets, exam_time_str = config_row
-    scheduled_dt = datetime.strptime(exam_time_str, "%Y-%m-%d %H:%M:%S")
-    
     try:
+        c = conn.cursor()
+        c.execute("SELECT category, board_stream, grade, subject, matrix_data, num_sets, exam_time, generated FROM paper_configs WHERE config_id = %s", (config_id,))
+        row = c.fetchone()
+        c.close()
+        return row
+    except Exception as e:
+        st.error(f"Error fetching config: {e}")
+        return None
+    finally:
+        conn.close()
+
+
+# --- HELPER FUNCTION: JIT (JUST-IN-TIME) GENERATION (PostgreSQL) ---
+def run_jit_generation_pg(config_id, api_key):
+    if not api_key:
+        return False, "API Key is required."
+
+    conn = get_db_connection()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT category, board_stream, grade, subject, matrix_data, num_sets, exam_time FROM paper_configs WHERE config_id = %s", (config_id,))
+        config_row = c.fetchone()
+
+        if not config_row:
+            return False, "Config ID not found."
+
+        cat, b_stream, grd, subj, matrix_json, n_sets, exam_time_str = config_row
+        scheduled_dt = datetime.strptime(exam_time_str, "%Y-%m-%d %H:%M:%S")
+
         client = genai.Client(api_key=api_key)
         matrix_specs = json.loads(matrix_json)
-        
+
         for i in range(n_sets):
-            set_name = f"Set_{chr(65+i)}"
-            set_id = f"{subj[:3].upper()}_{set_name}_{random.randint(1111,9999)}"
-            
+            set_name = f"Set_{chr(65 + i)}"
+            set_id = f"{subj[:3].upper()}_{set_name}_{random.randint(1111, 9999)}"
+
             prompt = f"""
             You are an elite AI assessment builder. Create a rigorous academic question paper set ({set_name}) adhering strictly to:
             Category: {cat}, Stream/Board: {b_stream}, Grade: {grd}, Subject: {subj}.
@@ -139,22 +143,22 @@ def run_jit_generation_pg(config_id, api_key):
                 raw_text = raw_text[7:-3].strip()
             elif raw_text.startswith("```"):
                 raw_text = raw_text[3:-3].strip()
-            
+
             parsed_q = json.loads(raw_text)
             expire_dt = scheduled_dt + timedelta(hours=3)
-            
+
             c.execute("INSERT INTO paper_sets (set_id, config_id, set_name, data, unlock_time, expires_at) VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT (set_id) DO UPDATE SET data = EXCLUDED.data",
                       (set_id, config_id, set_name, json.dumps(parsed_q), exam_time_str, str(expire_dt)))
-                      
+
         c.execute("UPDATE paper_configs SET generated = 1 WHERE config_id = %s", (config_id,))
         conn.commit()
         c.close()
-        conn.close()
         return True, "Success"
     except Exception as e:
-        if conn:
-            conn.close()
+        conn.rollback()
         return False, str(e)
+    finally:
+        conn.close()
 
 
 # ==========================================
@@ -281,42 +285,99 @@ if role == "Teacher Dashboard":
         
     scheduled_dt_str = f"{exam_date} {exam_time}"
     
+    def save_config(config_id):
+        conn = get_db_connection()
+        try:
+            c = conn.cursor()
+            c.execute("INSERT INTO paper_configs (config_id, category, board_stream, grade, subject, matrix_data, num_sets, exam_time, generated) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 0)",
+                      (config_id, category, board_stream, grade, subject, json.dumps(matrix_input_data), num_sets, scheduled_dt_str))
+            conn.commit()
+            c.close()
+            return True
+        except Exception as e:
+            conn.rollback()
+            st.error(f"Failed to save configuration: {e}")
+            return False
+        finally:
+            conn.close()
+
     b_col1, b_col2 = st.columns(2)
     with b_col1:
         if st.button("🚀 Schedule Exam Blueprint", type="primary"):
             if not api_key_input:
                 st.error("API Key required.")
+            elif not matrix_input_data or not any(row["chapter"].strip() for row in matrix_input_data):
+                st.error("Please define at least one chapter in the section blueprint.")
             else:
                 config_id = f"CFG_{subject[:3].upper()}_{random.randint(1000,9999)}"
-                conn = get_db_connection()
-                c = conn.cursor()
-                c.execute("INSERT INTO paper_configs (config_id, category, board_stream, grade, subject, matrix_data, num_sets, exam_time, generated) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 0)",
-                          (config_id, category, board_stream, grade, subject, json.dumps(matrix_input_data), num_sets, scheduled_dt_str))
-                conn.commit()
-                c.close()
-                conn.close()
-                st.success(f"✅ Config scheduled successfully! Config ID: **{config_id}**")
-                
+                if save_config(config_id):
+                    st.success(f"✅ Config scheduled successfully! Config ID: **{config_id}**")
+
     with b_col2:
         if st.button("⚡ Force Generate & Lock Sets Now"):
             if not api_key_input:
                 st.error("API Key required.")
+            elif not matrix_input_data or not any(row["chapter"].strip() for row in matrix_input_data):
+                st.error("Please define at least one chapter in the section blueprint.")
             else:
                 config_id = f"CFG_{subject[:3].upper()}_{random.randint(1000,9999)}"
-                conn = get_db_connection()
-                c = conn.cursor()
-                c.execute("INSERT INTO paper_configs (config_id, category, board_stream, grade, subject, matrix_data, num_sets, exam_time, generated) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, 0)",
-                          (config_id, category, board_stream, grade, subject, json.dumps(matrix_input_data), num_sets, scheduled_dt_str))
-                conn.commit()
-                c.close()
-                conn.close()
-                
-                with st.spinner("Synthesizing multi-set question banks..."):
-                    success, msg = run_jit_generation_pg(config_id, api_key_input)
-                    if success:
-                        st.success(f"🔥 Successfully generated! Config ID: **{config_id}**")
-                    else:
-                        st.error(f"Generation error: {msg}")
+                if save_config(config_id):
+                    with st.spinner("Synthesizing multi-set question banks..."):
+                        success, msg = run_jit_generation_pg(config_id, api_key_input)
+                        if success:
+                            st.success(f"🔥 Successfully generated! Config ID: **{config_id}**")
+                        else:
+                            st.error(f"Generation error: {msg}")
+
+# --- HELPER FUNCTION: FETCH AVAILABLE PAPER SETS ---
+def fetch_available_sets(config_id):
+    conn = get_db_connection()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT set_id, set_name, data, unlock_time, expires_at FROM paper_sets WHERE config_id = %s", (config_id,))
+        rows = c.fetchall()
+        c.close()
+        return rows
+    except Exception as e:
+        st.error(f"Error fetching paper sets: {e}")
+        return []
+    finally:
+        conn.close()
+
+
+# --- HELPER FUNCTION: INSERT STUDENT SUBMISSION ---
+def insert_submission(student_name, set_id, score, total_marks, student_answers, agent_report):
+    conn = get_db_connection()
+    try:
+        c = conn.cursor()
+        c.execute("INSERT INTO submissions (student, set_id, score, total_marks, student_answers, agent_report, submitted_at) VALUES (%s, %s, %s, %s, %s, %s, %s)",
+                  (student_name, set_id, score, total_marks, json.dumps(student_answers), agent_report, str(datetime.now())))
+        conn.commit()
+        c.close()
+        return True
+    except Exception as e:
+        conn.rollback()
+        st.error(f"Failed to save submission: {e}")
+        return False
+    finally:
+        conn.close()
+
+
+# --- HELPER FUNCTION: FETCH ALL SUBMISSIONS ---
+def fetch_all_submissions():
+    conn = get_db_connection()
+    try:
+        c = conn.cursor()
+        c.execute("SELECT id, student, set_id, score, total_marks, agent_report, submitted_at FROM submissions ORDER BY id DESC")
+        rows = c.fetchall()
+        c.close()
+        return rows
+    except Exception as e:
+        st.error(f"Error fetching submissions: {e}")
+        return []
+    finally:
+        conn.close()
+
 
 # ==========================================
 # 2. STUDENT PORTAL
@@ -343,20 +404,15 @@ elif role == "Student Examination Portal":
                 if api_key_input:
                     run_jit_generation_pg(input_config_id, api_key_input)
                     config_row = fetch_config(input_config_id)
-                    is_generated = config_row[7]
+                    is_generated = config_row[7] if config_row else 0
 
             if current_time < jit_trigger_dt:
                 st.warning(f"⏳ Assessment is locked until **{exam_time_str}**.")
             elif is_generated == 0:
                 st.error("⚠️ Assessment configuration awaiting activation key sync.")
             else:
-                conn = get_db_connection()
-                c = conn.cursor()
-                c.execute("SELECT set_id, set_name, data, unlock_time, expires_at FROM paper_sets WHERE config_id = %s", (input_config_id,))
-                available_sets = c.fetchall()
-                c.close()
-                conn.close()
-                
+                available_sets = fetch_available_sets(input_config_id)
+
                 if available_sets:
                     chosen_set = st.selectbox("Select Assigned Set Variant", available_sets, format_func=lambda x: f"{x[1]} (ID: {x[0]})")
                     set_id, set_name, data_json, u_time, e_time = chosen_set
@@ -380,7 +436,9 @@ elif role == "Student Examination Portal":
                             submitted_exam = st.form_submit_button("📤 Submit Final Examination", type="primary")
                             
                             if submitted_exam:
-                                if not api_key_input:
+                                if not student_name.strip():
+                                    st.error("Please enter your full name before submitting.")
+                                elif not api_key_input:
                                     st.error("API Key required for evaluation.")
                                 else:
                                     with st.spinner("Evaluating submissions..."):
@@ -405,18 +463,13 @@ elif role == "Student Examination Portal":
                                         except Exception:
                                             agent_report = "Deterministic evaluation report compiled successfully."
                                             
-                                        conn = get_db_connection()
-                                        c = conn.cursor()
-                                        c.execute("INSERT INTO submissions (student, set_id, score, total_marks, student_answers, agent_report, submitted_at) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                                                  (student_name, set_id, score, total_marks, json.dumps(student_answers), agent_report, str(datetime.now())))
-                                        conn.commit()
-                                        c.close()
-                                        conn.close()
-                                        
-                                        st.balloons()
-                                        st.success(f"🎉 Exam Submitted! Final Score: **{score} / {total_marks}**")
-                                        st.markdown("---")
-                                        st.markdown(agent_report)
+                                        if insert_submission(student_name, set_id, score, total_marks, student_answers, agent_report):
+                                            st.balloons()
+                                            st.success(f"🎉 Exam Submitted! Final Score: **{score} / {total_marks}**")
+                                            st.markdown("---")
+                                            st.markdown(agent_report)
+                else:
+                    st.warning("No paper sets found for this configuration yet.")
         else:
             st.error("Invalid Configuration ID.")
 
@@ -427,13 +480,8 @@ elif role == "Analytics & Reports Hub":
     st.header("📊 Analytics & Performance Hub")
     st.write("Review aggregated performance data, audits, and AI agent feedback reports.")
     
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT id, student, set_id, score, total_marks, agent_report, submitted_at FROM submissions ORDER BY id DESC")
-    subs = c.fetchall()
-    c.close()
-    conn.close()
-    
+    subs = fetch_all_submissions()
+
     if not subs:
         st.info("No submission records found in the database yet.")
     else:
