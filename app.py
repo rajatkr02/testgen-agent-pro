@@ -69,7 +69,8 @@ def call_groq_llm(api_key, prompt):
             {"role": "system", "content": "You are an elite academic assessment builder. Respond strictly with clean output."},
             {"role": "user", "content": prompt}
         ],
-        temperature=0.3
+        temperature=0.3,
+        max_tokens=4096  # <--- Ensures the model has enough output budget to finish large responses
     )
     return response.choices[0].message.content.strip()
 
@@ -86,11 +87,20 @@ def robust_parse_json(raw_text):
     cleaned = clean_json_response(raw_text)
     try:
         return json.loads(cleaned)
-    except json.JSONDecodeError:
+    except Exception:
+        # Fallback repair for truncated JSON responses
         try:
-            return ast.literal_eval(cleaned)
-        except Exception as e:
-            raise ValueError(f"Failed to parse LLM response as JSON: {e}\nRaw response:\n{cleaned}")
+            fixed = cleaned.strip()
+            open_braces = fixed.count('{') - fixed.count('}')
+            open_brackets = fixed.count('[') - fixed.count(']')
+            fixed += '}' * max(0, open_braces)
+            fixed += ']' * max(0, open_brackets)
+            return json.loads(fixed)
+        except Exception:
+            try:
+                return ast.literal_eval(cleaned)
+            except Exception as e:
+                raise ValueError(f"Failed to parse LLM response as JSON: {e}\nRaw response:\n{cleaned}")
 
 # --- JIT GENERATION HELPER ---
 def run_jit_generation(config_id, api_key):
@@ -105,7 +115,6 @@ def run_jit_generation(config_id, api_key):
         
     cat, b_stream, grd, subj, matrix_json, n_sets, exam_time_str = config_row
     
-    # Parse scheduled time with IST timezone awareness
     try:
         scheduled_dt = datetime.strptime(exam_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
     except ValueError:
@@ -304,7 +313,6 @@ elif role == "Student Examination Portal":
         if config_row:
             cat, b_stream, grd, subj, matrix_json, n_sets, exam_time_str, is_generated = config_row
             
-            # --- AUTO-GENERATION CHECK (Triggers within 2 mins of schedule or past it) ---
             try:
                 scheduled_dt = datetime.strptime(exam_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
             except ValueError:
