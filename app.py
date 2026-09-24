@@ -2,6 +2,7 @@ import streamlit as st
 import sqlite3
 import json
 import ast
+import re
 import random
 import pandas as pd
 from datetime import datetime, timedelta, timezone
@@ -64,35 +65,40 @@ with st.sidebar:
 def call_groq_llm(api_key, prompt):
     client = Groq(api_key=api_key)
     response = client.chat.completions.create(
-        model="openai/gpt-oss-20b",  # <--- Active Groq model ID
+        model="openai/gpt-oss-20b",
         messages=[
-            {"role": "system", "content": "You are an elite academic assessment builder. Respond strictly with clean output."},
+            {"role": "system", "content": "You are an elite academic assessment builder. Respond strictly with raw valid JSON only."},
             {"role": "user", "content": prompt}
         ],
         temperature=0.3,
-        max_tokens=4096  # <--- Ensures the model has enough output budget to finish large responses
+        max_tokens=4096
     )
     return response.choices[0].message.content.strip()
 
-def clean_json_response(raw_text):
-    if raw_text.startswith("```json"):
-        raw_text = raw_text[7:]
-    elif raw_text.startswith("```"):
-        raw_text = raw_text[3:]
-    if raw_text.endswith("```"):
-        raw_text = raw_text[:-3]
-    return raw_text.strip()
-
 def robust_parse_json(raw_text):
-    cleaned = clean_json_response(raw_text)
+    """Advanced robust parser that extracts JSON blocks via regex and auto-repairs truncated outputs."""
+    # 1. Try to locate JSON array or object block using regex
+    match = re.search(r'(\[.*\]|\{.*\})', raw_text, re.DOTALL)
+    cleaned = match.group(0) if match else raw_text
+    
+    # Clean markdown code block markers if present
+    cleaned = cleaned.replace("```json", "").replace("```", "").strip()
+    
     try:
         return json.loads(cleaned)
     except Exception:
-        # Fallback repair for truncated JSON responses
         try:
+            # Auto-repair unclosed brackets/braces from token cutoffs
             fixed = cleaned.strip()
             open_braces = fixed.count('{') - fixed.count('}')
             open_brackets = fixed.count('[') - fixed.count(']')
+            
+            # If it cut off inside a string or key, strip back to the last safe comma or delimiter
+            if open_braces < 0 or open_brackets < 0:
+                fixed = fixed[:max(fixed.rfind('}'), fixed.rfind(']')) + 1]
+                open_braces = fixed.count('{') - fixed.count('}')
+                open_brackets = fixed.count('[') - fixed.count(']')
+                
             fixed += '}' * max(0, open_braces)
             fixed += ']' * max(0, open_brackets)
             return json.loads(fixed)
@@ -100,7 +106,7 @@ def robust_parse_json(raw_text):
             try:
                 return ast.literal_eval(cleaned)
             except Exception as e:
-                raise ValueError(f"Failed to parse LLM response as JSON: {e}\nRaw response:\n{cleaned}")
+                raise ValueError(f"Failed to parse LLM response as JSON: {e}\nRaw response:\n{raw_text}")
 
 # --- JIT GENERATION HELPER ---
 def run_jit_generation(config_id, api_key):
