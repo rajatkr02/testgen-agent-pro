@@ -1,6 +1,7 @@
 import streamlit as st
 import sqlite3
 import json
+import ast
 import random
 import pandas as pd
 from datetime import datetime, timedelta, timezone
@@ -81,6 +82,16 @@ def clean_json_response(raw_text):
         raw_text = raw_text[:-3]
     return raw_text.strip()
 
+def robust_parse_json(raw_text):
+    cleaned = clean_json_response(raw_text)
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        try:
+            return ast.literal_eval(cleaned)
+        except Exception as e:
+            raise ValueError(f"Failed to parse LLM response as JSON: {e}\nRaw response:\n{cleaned}")
+
 # --- JIT GENERATION HELPER ---
 def run_jit_generation(config_id, api_key):
     conn = get_db_connection()
@@ -93,7 +104,12 @@ def run_jit_generation(config_id, api_key):
         return False, "Config ID not found."
         
     cat, b_stream, grd, subj, matrix_json, n_sets, exam_time_str = config_row
-    scheduled_dt = datetime.strptime(exam_time_str, "%Y-%m-%d %H:%M:%S")
+    
+    # Parse scheduled time with IST timezone awareness
+    try:
+        scheduled_dt = datetime.strptime(exam_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
+    except ValueError:
+        scheduled_dt = get_ist_now()
     
     try:
         matrix_specs = json.loads(matrix_json)
@@ -121,12 +137,11 @@ def run_jit_generation(config_id, api_key):
             ]
             """
             raw_text = call_groq_llm(api_key, prompt)
-            cleaned = clean_json_response(raw_text)
-            parsed_q = json.loads(cleaned)
+            parsed_q = robust_parse_json(raw_text)
             expire_dt = scheduled_dt + timedelta(hours=3)
             
             c.execute("INSERT OR REPLACE INTO paper_sets VALUES (?, ?, ?, ?, ?, ?)",
-                      (set_id, config_id, set_name, json.dumps(parsed_q), exam_time_str, str(expire_dt)))
+                      (set_id, config_id, set_name, json.dumps(parsed_q), str(scheduled_dt.strftime("%Y-%m-%d %H:%M:%S")), str(expire_dt.strftime("%Y-%m-%d %H:%M:%S"))))
                       
         c.execute("UPDATE paper_configs SET generated = 1 WHERE config_id = ?", (config_id,))
         conn.commit()
@@ -176,8 +191,7 @@ if role == "Teacher Dashboard":
                 try:
                     prompt = f"List official core subjects for Category: {category}, Board/Stream: {board_stream}, Level: {grade}. Return ONLY a raw JSON array of strings: [\"Subject 1\", \"Subject 2\"]."
                     clean_res = call_groq_llm(api_key_input, prompt)
-                    cleaned = clean_json_response(clean_res)
-                    st.session_state.fetched_subjects = json.loads(cleaned)
+                    st.session_state.fetched_subjects = robust_parse_json(clean_res)
                     st.success("Subjects discovered!")
                 except Exception as e:
                     st.error(f"Discovery error: {e}")
@@ -198,8 +212,7 @@ if role == "Teacher Dashboard":
                 [{{"chapter": "Chapter Name 1", "topics": "Topic A, Topic B"}}]
                 """
                 clean_res = call_groq_llm(api_key_input, prompt)
-                cleaned = clean_json_response(clean_res)
-                discovered_matrix = json.loads(cleaned)
+                discovered_matrix = robust_parse_json(clean_res)
                 
                 st.session_state.matrix_rows = []
                 for item in discovered_matrix:
@@ -291,11 +304,26 @@ elif role == "Student Examination Portal":
         if config_row:
             cat, b_stream, grd, subj, matrix_json, n_sets, exam_time_str, is_generated = config_row
             
-            # Instant JIT Generation fallback if sets aren't synthesized yet
-            if is_generated == 0 and api_key_input:
-                run_jit_generation(input_config_id, api_key_input)
-                config_row = fetch_config(input_config_id)
-                is_generated = config_row[7]
+            # --- AUTO-GENERATION CHECK (Triggers within 2 mins of schedule or past it) ---
+            try:
+                scheduled_dt = datetime.strptime(exam_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
+            except ValueError:
+                scheduled_dt = get_ist_now()
+                
+            current_dt = get_ist_now()
+            
+            if is_generated == 0 and current_dt >= (scheduled_dt - timedelta(minutes=2)):
+                if api_key_input:
+                    with st.spinner("⏰ Exam scheduled time reached or approaching! Automatically generating question sets..."):
+                        success, msg = run_jit_generation(input_config_id, api_key_input)
+                        if success:
+                            st.success("✨ Sets successfully auto-generated just in time for the exam!")
+                            config_row = fetch_config(input_config_id)
+                            is_generated = config_row[7]
+                        else:
+                            st.error(f"Auto-generation error: {msg}")
+                else:
+                    st.warning("⚠️ Exam schedule time has arrived, but the Groq API Key is missing in the sidebar. Please enter your API key to enable auto-generation.")
 
             conn = get_db_connection()
             c = conn.cursor()
@@ -307,7 +335,6 @@ elif role == "Student Examination Portal":
                 chosen_set = st.selectbox("Select Assigned Set Variant", available_sets, format_func=lambda x: f"{x[1]} (ID: {x[0]})")
                 set_id, set_name, data_json, u_time, e_time = chosen_set
                 
-                # Check if this student has already submitted this set variant
                 conn = get_db_connection()
                 c = conn.cursor()
                 c.execute("SELECT score, total_marks, agent_report, submitted_at FROM submissions WHERE student = ? AND set_id = ?", (student_name.strip(), set_id))
@@ -365,7 +392,7 @@ elif role == "Student Examination Portal":
                                     st.success(f"🎉 Exam Submitted & Locked! Final Score: **{score} / {total_marks}**")
                                     st.rerun()
             else: 
-                st.warning("⚠️ Question sets are not yet generated for this configuration ID. Go back to the Teacher Dashboard and click **'Force Generate & Lock Sets Now'**.")
+                st.warning("⚠️ Question sets are not yet generated. They will automatically synthesize once the exam schedule time is reached (or click **'Force Generate & Lock Sets Now'** in the Teacher Dashboard).")
         else: st.error("Invalid Configuration ID.")
     else:
         st.info("💡 Please enter your full name and a valid Assessment Config ID to access your exam paper.")
