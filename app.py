@@ -92,7 +92,7 @@ def run_jit_generation(config_id, api_key):
               }}
             ]
             """
-            response = client.models.generate_content(model='gemini-3.8-flash', contents=prompt)
+            response = client.models.generate_content(model='gemini-3.5-flash', contents=prompt)
             raw_text = response.text.strip()
             if raw_text.startswith("```json"): raw_text = raw_text[7:-3].strip()
             elif raw_text.startswith("```"): raw_text = raw_text[3:-3].strip()
@@ -151,7 +151,7 @@ if role == "Teacher Dashboard":
                 try:
                     client = genai.Client(api_key=api_key_input)
                     prompt = f"List official core subjects for Category: {category}, Board/Stream: {board_stream}, Level: {grade}. Return ONLY a raw JSON array of strings: [\"Subject 1\", \"Subject 2\"]."
-                    res = client.models.generate_content(model='gemini-3.8-flash', contents=prompt)
+                    res = client.models.generate_content(model='gemini-3.5-flash', contents=prompt)
                     clean_res = res.text.strip()
                     if clean_res.startswith("```json"): clean_res = clean_res[7:-3].strip()
                     elif clean_res.startswith("```"): clean_res = clean_res[3:-3].strip()
@@ -176,7 +176,7 @@ if role == "Teacher Dashboard":
                 Return ONLY a raw JSON array of objects with keys 'chapter' and 'topics' (as a comma-separated string):
                 [{{"chapter": "Chapter Name 1", "topics": "Topic A, Topic B"}}]
                 """
-                res = client.models.generate_content(model='gemini-3.8-flash', contents=prompt)
+                res = client.models.generate_content(model='gemini-3.5-flash', contents=prompt)
                 clean_res = res.text.strip()
                 if clean_res.startswith("```json"): clean_res = clean_res[7:-3].strip()
                 elif clean_res.startswith("```"): clean_res = clean_res[3:-3].strip()
@@ -321,7 +321,7 @@ elif role == "Student Examination Portal":
                                         try:
                                             client = genai.Client(api_key=api_key_input)
                                             eval_prompt = f"Analyze this student exam submission: Student: {student_name}, Score: {score}/{total_marks}. Provide a detailed diagnostic report in clear markdown."
-                                            eval_res = client.models.generate_content(model='gemini-3.8-flash', contents=eval_prompt)
+                                            eval_res = client.models.generate_content(model='gemini-3.5-flash', contents=eval_prompt)
                                             agent_report = eval_res.text
                                         except Exception:
                                             agent_report = "Deterministic evaluation report compiled successfully."
