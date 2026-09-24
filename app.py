@@ -57,7 +57,7 @@ with st.sidebar:
 def call_groq_llm(api_key, prompt):
     client = Groq(api_key=api_key)
     response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",  # <--- Updated model ID
+        model="llama-3.1-8b-instant",  # <--- Use this verified free-tier Groq model ID
         messages=[
             {"role": "system", "content": "You are an elite academic assessment builder. Respond strictly with clean output."},
             {"role": "user", "content": prompt}
