@@ -36,7 +36,7 @@ def init_db():
     conn = sqlite3.connect("exam_platform_poc.db", check_same_thread=False)
     c = conn.cursor()
     c.execute('''CREATE TABLE IF NOT EXISTS paper_configs 
-                 (config_id TEXT PRIMARY KEY, category TEXT, board_stream TEXT, grade TEXT, subject TEXT, matrix_data TEXT, num_sets INTEGER, exam_time TEXT, generated INT)''')
+                 (config_id TEXT PRIMARY KEY, category TEXT, board_stream TEXT, grade TEXT, subject TEXT, language TEXT, matrix_data TEXT, num_sets INTEGER, exam_time TEXT, generated INT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS paper_sets 
                  (set_id TEXT PRIMARY KEY, config_id TEXT, set_name TEXT, data TEXT, unlock_time TEXT, expires_at TEXT)''')
     c.execute('''CREATE TABLE IF NOT EXISTS submissions 
@@ -56,6 +56,13 @@ with st.sidebar:
     st.markdown("---")
     api_key_input = st.text_input("🔑 Groq API Key", type="password", help="Enter your free Groq API key from console.groq.com")
     st.markdown("---")
+    exam_language = st.selectbox(
+        "🌐 Language / Medium", 
+        ["English", "Hindi (हिन्दी)", "Sanskrit (संस्कृतम्)", "Regional / Other"],
+        index=0,
+        help="Select output language for syllabus, questions, and evaluation reports."
+    )
+    st.markdown("---")
     role = st.selectbox(
         "🧭 Navigation Portal", 
         ["Teacher Dashboard", "Student Examination Portal", "Analytics & Reports Hub", "Live Database Inspector"]
@@ -67,7 +74,7 @@ def call_groq_llm(api_key, prompt):
     response = client.chat.completions.create(
         model="openai/gpt-oss-20b",
         messages=[
-            {"role": "system", "content": "You are an elite academic assessment builder. Respond strictly with raw valid JSON or structured Markdown as requested."},
+            {"role": "system", "content": "You are an elite multi-lingual academic assessment builder. Respond strictly with raw valid JSON or structured Markdown as requested, preserving exact unicode/script characters (e.g., Devanagari for Hindi/Sanskrit)."},
             {"role": "user", "content": prompt}
         ],
         temperature=0.3,
@@ -106,14 +113,14 @@ def robust_parse_json(raw_text):
 def run_jit_generation(config_id, api_key):
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT category, board_stream, grade, subject, matrix_data, num_sets, exam_time FROM paper_configs WHERE config_id = ?", (config_id,))
+    c.execute("SELECT category, board_stream, grade, subject, language, matrix_data, num_sets, exam_time FROM paper_configs WHERE config_id = ?", (config_id,))
     config_row = c.fetchone()
     
     if not config_row:
         conn.close()
         return False, "Config ID not found."
         
-    cat, b_stream, grd, subj, matrix_json, n_sets, exam_time_str = config_row
+    cat, b_stream, grd, subj, lang, matrix_json, n_sets, exam_time_str = config_row
     
     try:
         scheduled_dt = datetime.strptime(exam_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
@@ -130,17 +137,18 @@ def run_jit_generation(config_id, api_key):
             prompt = f"""
             Create a rigorous academic question paper set ({set_name}) adhering strictly to:
             Category: {cat}, Stream/Board: {b_stream}, Grade: {grd}, Subject: {subj}.
+            Language Medium: {lang} (Generate all questions, chapter names, options, and explanations in this exact language/script).
             Based on this section matrix breakdown (incorporating target difficulty levels like Easy/Moderate/High): {json.dumps(matrix_specs)}.
             Ensure unique wording to prevent cheating. Return ONLY a raw valid JSON array format and nothing else:
             [
               {{
                 "id": "q1",
-                "chapter": "Chapter Name",
+                "chapter": "Chapter Name in {lang}",
                 "level": "Moderate",
                 "type": "MCQ",
-                "q": "Question string?",
-                "options": ["A", "B", "C", "D"],
-                "correct": "A",
+                "q": "Question string in {lang}?",
+                "options": ["Option A", "Option B", "Option C", "Option D"],
+                "correct": "Option A",
                 "marks": 2
               }}
             ]
@@ -150,7 +158,7 @@ def run_jit_generation(config_id, api_key):
             expire_dt = scheduled_dt + timedelta(hours=3)
             
             c.execute("INSERT OR REPLACE INTO paper_sets VALUES (?, ?, ?, ?, ?, ?)",
-                      (set_id, config_id, set_name, json.dumps(parsed_q), str(scheduled_dt.strftime("%Y-%m-%d %H:%M:%S")), str(expire_dt.strftime("%Y-%m-%d %H:%M:%S"))))
+                      (set_id, config_id, set_name, json.dumps(parsed_q, ensure_ascii=False), str(scheduled_dt.strftime("%Y-%m-%d %H:%M:%S")), str(expire_dt.strftime("%Y-%m-%d %H:%M:%S"))))
                       
         c.execute("UPDATE paper_configs SET generated = 1 WHERE config_id = ?", (config_id,))
         conn.commit()
@@ -163,7 +171,7 @@ def run_jit_generation(config_id, api_key):
 def fetch_config(config_id):
     conn = get_db_connection()
     c = conn.cursor()
-    c.execute("SELECT category, board_stream, grade, subject, matrix_data, num_sets, exam_time, generated FROM paper_configs WHERE config_id = ?", (config_id,))
+    c.execute("SELECT category, board_stream, grade, subject, language, matrix_data, num_sets, exam_time, generated FROM paper_configs WHERE config_id = ?", (config_id,))
     row = c.fetchone()
     conn.close()
     return row
@@ -192,13 +200,13 @@ if role == "Teacher Dashboard":
         else:
             grade = st.selectbox("Target Tier", ["Target Tier 1", "Target Tier 2"], key="grade_entrance")
 
-    st.markdown("### 📚 Subject Discovery & Mapping")
+    st.markdown(f"### 📚 Subject Discovery & Mapping ({exam_language} Medium)")
     sub_col1, sub_col2 = st.columns([3, 1])
     with sub_col1:
         if api_key_input and st.button("🤖 Discover Official Subjects via Groq"):
             with st.spinner("Querying board frameworks..."):
                 try:
-                    prompt = f"List official core subjects for Category: {category}, Board/Stream: {board_stream}, Level: {grade}. Return ONLY a raw JSON array of strings: [\"Subject 1\", \"Subject 2\"]."
+                    prompt = f"List official core subjects for Category: {category}, Board/Stream: {board_stream}, Level: {grade}, Language/Medium: {exam_language}. Return ONLY a raw JSON array of strings in {exam_language}: [\"Subject 1\", \"Subject 2\"]."
                     clean_res = call_groq_llm(api_key_input, prompt)
                     st.session_state.fetched_subjects = robust_parse_json(clean_res)
                     st.success("Subjects discovered!")
@@ -208,7 +216,8 @@ if role == "Teacher Dashboard":
         if "fetched_subjects" in st.session_state and st.session_state.fetched_subjects:
             subject = st.selectbox("Select Discovered Subject", st.session_state.fetched_subjects, key="selected_discovered_subject")
         else:
-            subject = st.text_input("Core Subject Name", "Mathematics", key="manual_subject_input")
+            default_subj = "हिन्दी (Hindi)" if "Hindi" in exam_language else ("संस्कृत (Sanskrit)" if "Sanskrit" in exam_language else "Mathematics")
+            subject = st.text_input("Core Subject Name", default_subj, key="manual_subject_input")
 
     st.markdown("---")
     st.subheader("⚙️ Section Blueprint & Chapter Matrix")
@@ -216,9 +225,9 @@ if role == "Teacher Dashboard":
         with st.spinner("Extracting standard syllabus matrix..."):
             try:
                 prompt = f"""
-                Provide official core chapters and key topic units for Board: {board_stream}, Grade: {grade}, Subject: {subject}.
-                Return ONLY a raw JSON array of objects with keys 'chapter' and 'topics' (as a comma-separated string):
-                [{{"chapter": "Chapter Name 1", "topics": "Topic A, Topic B"}}]
+                Provide official core chapters and key topic units for Board: {board_stream}, Grade: {grade}, Subject: {subject} in Language: {exam_language}.
+                Return ONLY a raw JSON array of objects with keys 'chapter' and 'topics' (as a comma-separated string) in {exam_language}:
+                [{{"chapter": "Chapter Name", "topics": "Topic A, Topic B"}}]
                 """
                 clean_res = call_groq_llm(api_key_input, prompt)
                 discovered_matrix = robust_parse_json(clean_res)
@@ -232,7 +241,8 @@ if role == "Teacher Dashboard":
                 st.error(f"Mapping failed: {e}")
 
     if "matrix_rows" not in st.session_state:
-        st.session_state.matrix_rows = [{"chapter": "Introduction & Fundamentals", "topics": "Basic Concepts, Core Principles", "level": "Moderate", "q_type": "MCQ", "count": 2, "marks": 2}]
+        default_ch = "काव्य खंड एवं गद्य खंड" if ("Hindi" in exam_language or "Sanskrit" in exam_language) else "Introduction & Fundamentals"
+        st.session_state.matrix_rows = [{"chapter": default_ch, "topics": "Basic Concepts, Core Principles", "level": "Moderate", "q_type": "MCQ", "count": 2, "marks": 2}]
 
     matrix_input_data = []
     for idx, row in enumerate(st.session_state.matrix_rows):
@@ -275,8 +285,8 @@ if role == "Teacher Dashboard":
                 conn = get_db_connection()
                 c = conn.cursor()
                 c.execute(
-                    "INSERT OR REPLACE INTO paper_configs (config_id, category, board_stream, grade, subject, matrix_data, num_sets, exam_time, generated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
-                    (config_id, category, board_stream, grade, subject, json.dumps(matrix_input_data), num_sets, scheduled_dt_str)
+                    "INSERT OR REPLACE INTO paper_configs (config_id, category, board_stream, grade, subject, language, matrix_data, num_sets, exam_time, generated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                    (config_id, category, board_stream, grade, subject, exam_language, json.dumps(matrix_input_data, ensure_ascii=False), num_sets, scheduled_dt_str)
                 )
                 conn.commit()
                 conn.close()
@@ -289,8 +299,8 @@ if role == "Teacher Dashboard":
                 conn = get_db_connection()
                 c = conn.cursor()
                 c.execute(
-                    "INSERT OR REPLACE INTO paper_configs (config_id, category, board_stream, grade, subject, matrix_data, num_sets, exam_time, generated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
-                    (config_id, category, board_stream, grade, subject, json.dumps(matrix_input_data), num_sets, scheduled_dt_str)
+                    "INSERT OR REPLACE INTO paper_configs (config_id, category, board_stream, grade, subject, language, matrix_data, num_sets, exam_time, generated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                    (config_id, category, board_stream, grade, subject, exam_language, json.dumps(matrix_input_data, ensure_ascii=False), num_sets, scheduled_dt_str)
                 )
                 conn.commit()
                 conn.close()
@@ -311,7 +321,7 @@ elif role == "Student Examination Portal":
     if input_config_id and student_name.strip():
         config_row = fetch_config(input_config_id)
         if config_row:
-            cat, b_stream, grd, subj, matrix_json, n_sets, exam_time_str, is_generated = config_row
+            cat, b_stream, grd, subj, lang, matrix_json, n_sets, exam_time_str, is_generated = config_row
             
             try:
                 scheduled_dt = datetime.strptime(exam_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
@@ -327,7 +337,7 @@ elif role == "Student Examination Portal":
                         if success:
                             st.success("✨ Sets successfully auto-generated just in time for the exam!")
                             config_row = fetch_config(input_config_id)
-                            is_generated = config_row[7]
+                            is_generated = config_row[8]
                         else:
                             st.error(f"Auto-generation error: {msg}")
                 else:
@@ -357,7 +367,7 @@ elif role == "Student Examination Portal":
                     st.markdown("### Diagnostic Evaluation Report")
                     st.markdown(p_report)
                 else:
-                    st.success(f"Session Active — **{set_name}** loaded successfully.")
+                    st.success(f"Session Active ({lang}) — **{set_name}** loaded successfully.")
                     questions = json.loads(data_json)
                     
                     with st.form("student_live_exam"):
@@ -400,7 +410,7 @@ elif role == "Student Examination Portal":
                                             
                                     try:
                                         eval_prompt = f"""
-                                        Analyze this student exam submission thoroughly and provide a comprehensive diagnostic evaluation report in rich markdown:
+                                        Analyze this student exam submission thoroughly and provide a comprehensive diagnostic evaluation report in rich markdown (in language: {lang}):
                                         Student Name: {student_name}
                                         Score: {score} out of {total_marks} ({score/total_marks*100:.1f}%)
                                         Question Details & Answers:
@@ -414,9 +424,8 @@ elif role == "Student Examination Portal":
                                         """
                                         agent_report = call_groq_llm(api_key_input, eval_prompt)
                                     except Exception as e:
-                                        # Detailed robust fallback markdown report if LLM call fails
                                         agent_report = f"""
-### 📋 Detailed Diagnostic Evaluation Report
+### 📋 Detailed Diagnostic Evaluation Report ({lang})
 
 * **Student Name:** {student_name}
 * **Final Score:** **{score} / {total_marks}** ({score/total_marks*100:.1f}%)
@@ -436,7 +445,7 @@ The student completed the assessment set. Review the incorrect responses above t
                                     conn = get_db_connection()
                                     c = conn.cursor()
                                     c.execute("INSERT INTO submissions (student, set_id, score, total_marks, student_answers, agent_report, submitted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                              (student_name.strip(), set_id, score, total_marks, json.dumps(student_answers), agent_report, str(get_ist_now())))
+                                              (student_name.strip(), set_id, score, total_marks, json.dumps(student_answers, ensure_ascii=False), agent_report, str(get_ist_now())))
                                     conn.commit()
                                     conn.close()
                                     
