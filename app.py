@@ -231,8 +231,10 @@ if role == "Teacher Dashboard":
                 config_id = f"CFG_{subject[:3].upper()}_{random.randint(1000,9999)}"
                 conn = get_db_connection()
                 c = conn.cursor()
-                c.execute("INSERT OR REPLACE INTO paper_configs VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
-                          (config_id, category, board_stream, grade, subject, json.dumps(matrix_input_data), num_sets, scheduled_dt_str))
+                c.execute(
+    "INSERT OR REPLACE INTO paper_configs (config_id, category, board_stream, grade, subject, matrix_data, num_sets, exam_time, generated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+    (config_id, category, board_stream, grade, subject, json.dumps(matrix_input_data), num_sets, scheduled_dt_str)
+)
                 conn.commit()
                 conn.close()
                 st.success(f"✅ Config scheduled! Copy this Config ID for students: **{config_id}**")
@@ -243,8 +245,10 @@ if role == "Teacher Dashboard":
                 config_id = f"CFG_{subject[:3].upper()}_{random.randint(1000,9999)}"
                 conn = get_db_connection()
                 c = conn.cursor()
-                c.execute("INSERT OR REPLACE INTO paper_configs VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
-                          (config_id, category, board_stream, grade, subject, json.dumps(matrix_input_data), num_sets, scheduled_dt_str))
+                c.execute(
+    "INSERT OR REPLACE INTO paper_configs (config_id, category, board_stream, grade, subject, matrix_data, num_sets, exam_time, generated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+    (config_id, category, board_stream, grade, subject, json.dumps(matrix_input_data), num_sets, scheduled_dt_str)
+)
                 conn.commit()
                 conn.close()
                 with st.spinner("Synthesizing multi-set question banks..."):
