@@ -44,7 +44,7 @@ def get_db_connection():
 # --- SIDEBAR CONFIGURATION ---
 with st.sidebar:
     st.title("TestGen-Agent")
-    st.caption("Autonomous Academic Intelligence (Groq Powered)")
+    st.caption("Autonomous Academic Intelligence")
     st.markdown("---")
     api_key_input = st.text_input("🔑 Groq API Key", type="password", help="Enter your free Groq API key from console.groq.com")
     st.markdown("---")
@@ -57,14 +57,23 @@ with st.sidebar:
 def call_groq_llm(api_key, prompt):
     client = Groq(api_key=api_key)
     response = client.chat.completions.create(
-        model="openai/gpt-oss-20b",  # <--- Change the model ID to this
+        model="llama-3.1-8b-instant",  # Stable high-throughput free-tier model ID
         messages=[
-            {"role": "system", "content": "You are an elite academic assessment builder. Respond strictly with clean output."},
+            {"role": "system", "content": "You are an elite academic assessment builder. Respond strictly with valid raw JSON format when requested, without extra conversational filler."},
             {"role": "user", "content": prompt}
         ],
         temperature=0.3
     )
     return response.choices[0].message.content.strip()
+
+def clean_json_response(raw_text):
+    if raw_text.startswith("```json"):
+        raw_text = raw_text[7:]
+    elif raw_text.startswith("```"):
+        raw_text = raw_text[3:]
+    if raw_text.endswith("```"):
+        raw_text = raw_text[:-3]
+    return raw_text.strip()
 
 # --- JIT GENERATION HELPER ---
 def run_jit_generation(config_id, api_key):
@@ -105,10 +114,8 @@ def run_jit_generation(config_id, api_key):
             ]
             """
             raw_text = call_groq_llm(api_key, prompt)
-            if raw_text.startswith("```json"): raw_text = raw_text[7:-3].strip()
-            elif raw_text.startswith("```"): raw_text = raw_text[3:-3].strip()
-            
-            parsed_q = json.loads(raw_text)
+            cleaned = clean_json_response(raw_text)
+            parsed_q = json.loads(cleaned)
             expire_dt = scheduled_dt + timedelta(hours=3)
             
             c.execute("INSERT OR REPLACE INTO paper_sets VALUES (?, ?, ?, ?, ?, ?)",
@@ -138,21 +145,21 @@ if role == "Teacher Dashboard":
     
     col1, col2, col3 = st.columns(3)
     with col1:
-        category = st.selectbox("Institution Category", ["School Board (K-12)", "College / University Stream", "Competitive / Entrance Exam"])
+        category = st.selectbox("Institution Category", ["School Board (K-12)", "College / University Stream", "Competitive / Entrance Exam"], key="teacher_category")
     with col2:
         if category == "School Board (K-12)":
-            board_stream = st.selectbox("Education Board", ["CBSE", "ICSE", "State Board (General)", "IB / IGCSE"])
+            board_stream = st.selectbox("Education Board", ["CBSE", "ICSE", "State Board (General)", "IB / IGCSE"], key="board_k12")
         elif category == "College / University Stream":
-            board_stream = st.selectbox("Stream", ["B.Tech / Computer Science", "B.Sc (Pure Sciences)", "B.Com / Management", "Medical / MBBS Basics"])
+            board_stream = st.selectbox("Stream", ["B.Tech / Computer Science", "B.Sc (Pure Sciences)", "B.Com / Management", "Medical / MBBS Basics"], key="board_uni")
         else:
-            board_stream = st.selectbox("Entrance Target", ["JEE (Main & Advanced)", "NEET (Medical)", "GATE (Engineering)", "UPSC Prelims"])
+            board_stream = st.selectbox("Entrance Target", ["JEE (Main & Advanced)", "NEET (Medical)", "GATE (Engineering)", "UPSC Prelims"], key="board_entrance")
     with col3:
         if category == "School Board (K-12)":
-            grade = st.selectbox("Class / Grade", ["Class 8", "Class 9", "Class 10", "Class 11", "Class 12"])
+            grade = st.selectbox("Class / Grade", ["Class 8", "Class 9", "Class 10", "Class 11", "Class 12"], key="grade_k12")
         elif category == "College / University Stream":
-            grade = st.selectbox("Semester", ["Semester 1", "Semester 2", "Semester 3", "Semester 4", "Final Year"])
+            grade = st.selectbox("Semester", ["Semester 1", "Semester 2", "Semester 3", "Semester 4", "Final Year"], key="grade_uni")
         else:
-            grade = st.selectbox("Target Tier", ["Target Tier 1", "Target Tier 2"])
+            grade = st.selectbox("Target Tier", ["Target Tier 1", "Target Tier 2"], key="grade_entrance")
 
     st.markdown("### 📚 Subject Discovery & Mapping")
     sub_col1, sub_col2 = st.columns([3, 1])
@@ -162,17 +169,16 @@ if role == "Teacher Dashboard":
                 try:
                     prompt = f"List official core subjects for Category: {category}, Board/Stream: {board_stream}, Level: {grade}. Return ONLY a raw JSON array of strings: [\"Subject 1\", \"Subject 2\"]."
                     clean_res = call_groq_llm(api_key_input, prompt)
-                    if clean_res.startswith("```json"): clean_res = clean_res[7:-3].strip()
-                    elif clean_res.startswith("```"): clean_res = clean_res[3:-3].strip()
-                    st.session_state.fetched_subjects = json.loads(clean_res)
+                    cleaned = clean_json_response(clean_res)
+                    st.session_state.fetched_subjects = json.loads(cleaned)
                     st.success("Subjects discovered!")
                 except Exception as e:
                     st.error(f"Discovery error: {e}")
 
         if "fetched_subjects" in st.session_state and st.session_state.fetched_subjects:
-            subject = st.selectbox("Select Discovered Subject", st.session_state.fetched_subjects)
+            subject = st.selectbox("Select Discovered Subject", st.session_state.fetched_subjects, key="selected_discovered_subject")
         else:
-            subject = st.text_input("Core Subject Name", "Mathematics")
+            subject = st.text_input("Core Subject Name", "Mathematics", key="manual_subject_input")
 
     st.markdown("---")
     st.subheader("⚙️ Section Blueprint & Chapter Matrix")
@@ -180,25 +186,24 @@ if role == "Teacher Dashboard":
         with st.spinner("Extracting standard syllabus matrix..."):
             try:
                 prompt = f"""
-                Provide official chapters and key topic units for Board: {board_stream}, Grade: {grade}, Subject: {subject}.
+                Provide official core chapters and key topic units for Board: {board_stream}, Grade: {grade}, Subject: {subject}.
                 Return ONLY a raw JSON array of objects with keys 'chapter' and 'topics' (as a comma-separated string):
                 [{{"chapter": "Chapter Name 1", "topics": "Topic A, Topic B"}}]
                 """
                 clean_res = call_groq_llm(api_key_input, prompt)
-                if clean_res.startswith("```json"): clean_res = clean_res[7:-3].strip()
-                elif clean_res.startswith("```"): clean_res = clean_res[3:-3].strip()
-                discovered_matrix = json.loads(clean_res)
+                cleaned = clean_json_response(clean_res)
+                discovered_matrix = json.loads(cleaned)
                 
                 st.session_state.matrix_rows = []
                 for item in discovered_matrix:
                     st.session_state.matrix_rows.append({"chapter": item.get("chapter", ""), "topics": item.get("topics", ""), "q_type": "MCQ", "count": 2, "marks": 2})
-                st.success("Syllabus mapped!")
+                st.success("Syllabus successfully mapped!")
                 st.rerun()
             except Exception as e:
                 st.error(f"Mapping failed: {e}")
 
     if "matrix_rows" not in st.session_state:
-        st.session_state.matrix_rows = [{"chapter": "", "topics": "", "q_type": "MCQ", "count": 2, "marks": 2}]
+        st.session_state.matrix_rows = [{"chapter": "Introduction & Fundamentals", "topics": "Basic Concepts, Core Principles", "q_type": "MCQ", "count": 2, "marks": 2}]
 
     matrix_input_data = []
     for idx, row in enumerate(st.session_state.matrix_rows):
@@ -238,7 +243,6 @@ if role == "Teacher Dashboard":
                 config_id = f"CFG_{subject[:3].upper()}_{random.randint(1000,9999)}"
                 conn = get_db_connection()
                 c = conn.cursor()
-                # Fixed 8-column explicit insert to prevent operational errors
                 c.execute(
                     "INSERT OR REPLACE INTO paper_configs (config_id, category, board_stream, grade, subject, matrix_data, num_sets, exam_time, generated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
                     (config_id, category, board_stream, grade, subject, json.dumps(matrix_input_data), num_sets, scheduled_dt_str)
@@ -288,65 +292,66 @@ elif role == "Student Examination Portal":
                     is_generated = config_row[7]
 
             if current_time < jit_trigger_dt:
-                st.warning(f"⏳ Assessment is locked until **{exam_time_str}**.")
-            elif is_generated == 0:
-                st.error("⚠️ Assessment configuration awaiting activation key sync.")
-            else:
-                conn = get_db_connection()
-                c = conn.cursor()
-                c.execute("SELECT set_id, set_name, data, unlock_time, expires_at FROM paper_sets WHERE config_id = ?", (input_config_id,))
-                available_sets = c.fetchall()
-                conn.close()
+                # Bypass restriction for POC testing if user forces manual generation
+                if is_generated == 0 and api_key_input:
+                    run_jit_generation(input_config_id, api_key_input)
+                    config_row = fetch_config(input_config_id)
+                    is_generated = config_row[7]
+
+            conn = get_db_connection()
+            c = conn.cursor()
+            c.execute("SELECT set_id, set_name, data, unlock_time, expires_at FROM paper_sets WHERE config_id = ?", (input_config_id,))
+            available_sets = c.fetchall()
+            conn.close()
+            
+            if available_sets:
+                chosen_set = st.selectbox("Select Assigned Set Variant", available_sets, format_func=lambda x: f"{x[1]} (ID: {x[0]})")
+                set_id, set_name, data_json, u_time, e_time = chosen_set
                 
-                if available_sets:
-                    chosen_set = st.selectbox("Select Assigned Set Variant", available_sets, format_func=lambda x: f"{x[1]} (ID: {x[0]})")
-                    set_id, set_name, data_json, u_time, e_time = chosen_set
-                    
-                    if datetime.now() > datetime.strptime(e_time, "%Y-%m-%d %H:%M:%S"):
-                        st.error("❌ Submission window has expired.")
-                    else:
-                        st.success(f"Session Active — **{set_name}** loaded successfully.")
-                        questions = json.loads(data_json)
-                        
-                        with st.form("student_live_exam"):
-                            student_answers = {}
-                            for idx, q in enumerate(questions):
-                                st.markdown(f"**Q{idx+1}. [{q.get('chapter','General')}] {q['q']}** *({q['marks']} Marks)*")
-                                if "options" in q and q["options"]:
-                                    opts = q["options"].copy()
-                                    student_answers[q['id']] = st.radio(f"Select choice {idx+1}", opts, key=f"ans_{set_id}_{q['id']}")
-                                else:
-                                    student_answers[q['id']] = st.text_input(f"Answer {idx+1}", key=f"ans_{set_id}_{q['id']}")
-                                    
-                            submitted_exam = st.form_submit_button("📤 Submit Final Examination", type="primary")
-                            if submitted_exam:
-                                if not api_key_input: st.error("Groq API Key required.")
-                                else:
-                                    with st.spinner("Evaluating submissions..."):
-                                        score = 0
-                                        total_marks = 0
-                                        for q in questions:
-                                            total_marks += q['marks']
-                                            if str(student_answers.get(q['id'])).strip().lower() == str(q['correct']).strip().lower():
-                                                score += q['marks']
-                                                
-                                        try:
-                                            eval_prompt = f"Analyze this student exam submission: Student: {student_name}, Score: {score}/{total_marks}. Provide a detailed diagnostic report in clear markdown."
-                                            agent_report = call_groq_llm(api_key_input, eval_prompt)
-                                        except Exception:
-                                            agent_report = "Deterministic evaluation report compiled successfully."
-                                            
-                                        conn = get_db_connection()
-                                        c = conn.cursor()
-                                        c.execute("INSERT INTO submissions (student, set_id, score, total_marks, student_answers, agent_report, submitted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                                  (student_name, set_id, score, total_marks, json.dumps(student_answers), agent_report, str(datetime.now())))
-                                        conn.commit()
-                                        conn.close()
+                st.success(f"Session Active — **{set_name}** loaded successfully.")
+                questions = json.loads(data_json)
+                
+                with st.form("student_live_exam"):
+                    student_answers = {}
+                    for idx, q in enumerate(questions):
+                        st.markdown(f"**Q{idx+1}. [{q.get('chapter','General')}] {q['q']}** *({q['marks']} Marks)*")
+                        if "options" in q and q["options"]:
+                            opts = q["options"].copy()
+                            student_answers[q['id']] = st.radio(f"Select choice {idx+1}", opts, key=f"ans_{set_id}_{q['id']}")
+                        else:
+                            student_answers[q['id']] = st.text_input(f"Answer {idx+1}", key=f"ans_{set_id}_{q['id']}")
+                            
+                    submitted_exam = st.form_submit_button("📤 Submit Final Examination", type="primary")
+                    if submitted_exam:
+                        if not api_key_input: st.error("Groq API Key required.")
+                        else:
+                            with st.spinner("Evaluating submissions..."):
+                                score = 0
+                                total_marks = 0
+                                for q in questions:
+                                    total_marks += q['marks']
+                                    if str(student_answers.get(q['id'])).strip().lower() == str(q['correct']).strip().lower():
+                                        score += q['marks']
                                         
-                                        st.balloons()
-                                        st.success(f"🎉 Exam Submitted! Final Score: **{score} / {total_marks}**")
-                                        st.markdown("---")
-                                        st.markdown(agent_report)
+                                try:
+                                    eval_prompt = f"Analyze this student exam submission: Student: {student_name}, Score: {score}/{total_marks}. Provide a detailed diagnostic report in clear markdown."
+                                    agent_report = call_groq_llm(api_key_input, eval_prompt)
+                                except Exception:
+                                    agent_report = "Deterministic evaluation report compiled successfully."
+                                    
+                                conn = get_db_connection()
+                                c = conn.cursor()
+                                c.execute("INSERT INTO submissions (student, set_id, score, total_marks, student_answers, agent_report, submitted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                                          (student_name, set_id, score, total_marks, json.dumps(student_answers), agent_report, str(datetime.now())))
+                                conn.commit()
+                                conn.close()
+                                
+                                st.balloons()
+                                st.success(f"🎉 Exam Submitted! Final Score: **{score} / {total_marks}**")
+                                st.markdown("---")
+                                st.markdown(agent_report)
+            else: 
+                st.warning("⚠️ Question sets are not yet generated for this configuration ID. Go back to the Teacher Dashboard and click **'Force Generate & Lock Sets Now'**.")
         else: st.error("Invalid Configuration ID.")
 
 # ==========================================
