@@ -31,42 +31,24 @@ IST = timezone(timedelta(hours=5, minutes=30))
 def get_ist_now():
     return datetime.now(IST)
 
-# --- LOCAL SQLITE DATABASE INITIALIZATION & AUTO-MIGRATION ---
+# --- LOCAL SQLITE DATABASE INITIALIZATION ---
 def init_db():
-    db_file = "exam_platform_poc.db"
-    try:
-        conn = sqlite3.connect(db_file, check_same_thread=False)
-        c = conn.cursor()
-        
-        # Test if the existing table matches the current column count expectation
-        c.execute("CREATE TABLE IF NOT EXISTS paper_configs (config_id TEXT PRIMARY KEY, category TEXT, board_stream TEXT, grade TEXT, subject TEXT, language TEXT, matrix_data TEXT, num_sets INTEGER, exam_time TEXT, generated INT)")
-        c.execute("CREATE TABLE IF NOT EXISTS paper_sets (set_id TEXT PRIMARY KEY, config_id TEXT, set_name TEXT, data TEXT, unlock_time TEXT, expires_at TEXT)")
-        c.execute("CREATE TABLE IF NOT EXISTS submissions (id INTEGER PRIMARY KEY AUTOINCREMENT, student TEXT, set_id TEXT, score REAL, total_marks REAL, student_answers TEXT, agent_report TEXT, submitted_at TEXT)")
-        conn.commit()
-        conn.close()
-    except sqlite3.OperationalError:
-        # If schema is corrupted/outdated beyond safe alteration, wipe and recreate
-        if conn:
-            conn.close()
-        if os.path.exists(db_file):
-            os.remove(db_file)
-        
-        # Re-initialize fresh database
-        conn = sqlite3.connect(db_file, check_same_thread=False)
-        c = conn.cursor()
-        c.execute('''CREATE TABLE paper_configs
-                     (config_id TEXT PRIMARY KEY, category TEXT, board_stream TEXT, grade TEXT, subject TEXT, language TEXT, matrix_data TEXT, num_sets INTEGER, exam_time TEXT, generated INT)''')
-        c.execute('''CREATE TABLE paper_sets
-                     (set_id TEXT PRIMARY KEY, config_id TEXT, set_name TEXT, data TEXT, unlock_time TEXT, expires_at TEXT)''')
-        c.execute('''CREATE TABLE submissions
-                     (id INTEGER PRIMARY KEY AUTOINCREMENT, student TEXT, set_id TEXT, score REAL, total_marks REAL, student_answers TEXT, agent_report TEXT, submitted_at TEXT)''')
-        conn.commit()
-        conn.close()
+    # Changed filename to force a brand new, clean database creation
+    conn = sqlite3.connect("exam_platform_v2.db", check_same_thread=False)
+    c = conn.cursor()
+    c.execute('''CREATE TABLE IF NOT EXISTS paper_configs
+                 (config_id TEXT PRIMARY KEY, category TEXT, board_stream TEXT, grade TEXT, subject TEXT, language TEXT, matrix_data TEXT, num_sets INTEGER, exam_time TEXT, generated INT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS paper_sets
+                 (set_id TEXT PRIMARY KEY, config_id TEXT, set_name TEXT, data TEXT, unlock_time TEXT, expires_at TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS submissions
+                 (id INTEGER PRIMARY KEY AUTOINCREMENT, student TEXT, set_id TEXT, score REAL, total_marks REAL, student_answers TEXT, agent_report TEXT, submitted_at TEXT)''')
+    conn.commit()
+    conn.close()
  
 init_db()
-
+ 
 def get_db_connection():
-    return sqlite3.connect("exam_platform_poc.db", check_same_thread=False)
+    return sqlite3.connect("exam_platform_v2.db", check_same_thread=False)
 
 # --- SIDEBAR CONFIGURATION ---
 with st.sidebar:
