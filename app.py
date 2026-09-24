@@ -31,31 +31,27 @@ IST = timezone(timedelta(hours=5, minutes=30))
 def get_ist_now():
     return datetime.now(IST)
 
-# --- LOCAL SQLITE DATABASE INITIALIZATION & ROBUST MIGRATION ---
+# --- LOCAL SQLITE DATABASE INITIALIZATION & AUTO-MIGRATION ---
 def init_db():
     conn = sqlite3.connect("exam_platform_poc.db", check_same_thread=False)
     c = conn.cursor()
     
-    # Create tables if they don't exist
+    # Check if paper_configs exists and has the correct schema columns
+    c.execute("PRAGMA table_info(paper_configs)")
+    existing_cols = [col[1] for col in c.fetchall()]
+    
+    # If the table exists but lacks the 'generated' column or has mismatched schema, drop it to prevent OperationalErrors
+    if existing_cols and 'generated' not in existing_cols:
+        c.execute("DROP TABLE paper_configs")
+        
     c.execute('''CREATE TABLE IF NOT EXISTS paper_configs 
-                 (config_id TEXT PRIMARY KEY, category TEXT, board_stream TEXT, grade TEXT, subject TEXT, language TEXT, matrix_data TEXT, num_sets INTEGER, exam_time TEXT, generated INT DEFAULT 0)''')
+                 (config_id TEXT PRIMARY KEY, category TEXT, board_stream TEXT, grade TEXT, subject TEXT, language TEXT, matrix_data TEXT, num_sets INTEGER, exam_time TEXT, generated INT)''')
                  
     c.execute('''CREATE TABLE IF NOT EXISTS paper_sets 
                  (set_id TEXT PRIMARY KEY, config_id TEXT, set_name TEXT, data TEXT, unlock_time TEXT, expires_at TEXT)''')
                  
     c.execute('''CREATE TABLE IF NOT EXISTS submissions 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, student TEXT, set_id TEXT, score REAL, total_marks REAL, student_answers TEXT, agent_report TEXT, submitted_at TEXT)''')
-
-    # Robust migration: Check existing columns in paper_configs and add missing ones if upgrading from older DB versions
-    c.execute("PRAGMA table_info(paper_configs)")
-    existing_columns = [col[1] for col in c.fetchall()]
-    
-    if "generated" not in existing_columns:
-        try:
-            c.execute("ALTER TABLE paper_configs ADD COLUMN generated INT DEFAULT 0")
-        except sqlite3.OperationalError:
-            pass
-            
     conn.commit()
     conn.close()
 
