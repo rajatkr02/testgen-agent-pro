@@ -76,24 +76,18 @@ def call_groq_llm(api_key, prompt):
     return response.choices[0].message.content.strip()
 
 def robust_parse_json(raw_text):
-    """Advanced robust parser that extracts JSON blocks via regex and auto-repairs truncated outputs."""
-    # 1. Try to locate JSON array or object block using regex
     match = re.search(r'(\[.*\]|\{.*\})', raw_text, re.DOTALL)
     cleaned = match.group(0) if match else raw_text
-    
-    # Clean markdown code block markers if present
     cleaned = cleaned.replace("```json", "").replace("```", "").strip()
     
     try:
         return json.loads(cleaned)
     except Exception:
         try:
-            # Auto-repair unclosed brackets/braces from token cutoffs
             fixed = cleaned.strip()
             open_braces = fixed.count('{') - fixed.count('}')
             open_brackets = fixed.count('[') - fixed.count(']')
             
-            # If it cut off inside a string or key, strip back to the last safe comma or delimiter
             if open_braces < 0 or open_brackets < 0:
                 fixed = fixed[:max(fixed.rfind('}'), fixed.rfind(']')) + 1]
                 open_braces = fixed.count('{') - fixed.count('}')
@@ -369,8 +363,14 @@ elif role == "Student Examination Portal":
                     with st.form("student_live_exam"):
                         student_answers = {}
                         for idx, q in enumerate(questions):
-                            lvl_badge = f"*{q.get('level','Moderate')}*"
-                            st.markdown(f"**Q{idx+1}. [{q.get('chapter','General')} | {lvl_badge}] {q['q']}** *({q['marks']} Marks)*")
+                            # Clean variable extraction to prevent f-string quote nesting syntax issues
+                            q_chapter = q.get('chapter', 'General')
+                            q_level = q.get('level', 'Moderate')
+                            q_text = q.get('q', '')
+                            q_marks = q.get('marks', 1)
+                            
+                            st.markdown(f"**Q{idx+1}. [{q_chapter} | *{q_level}*] {q_text}** *({q_marks} Marks)*")
+                            
                             if "options" in q and q["options"]:
                                 opts = q["options"].copy()
                                 student_answers[q['id']] = st.radio(f"Select choice {idx+1}", opts, key=f"ans_{set_id}_{q['id']}")
