@@ -3,7 +3,7 @@ import sqlite3
 import json
 import random
 import pandas as pd
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from groq import Groq
 
 # --- PAGE CONFIGURATION ---
@@ -22,6 +22,12 @@ st.markdown("""
     div.block-container { padding-top: 2rem; }
     </style>
 """, unsafe_allow_html=True)
+
+# --- TIMEZONE SETUP (IST: UTC+5:30) ---
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def get_ist_now():
+    return datetime.now(IST)
 
 # --- LOCAL SQLITE DATABASE INITIALIZATION ---
 def init_db():
@@ -57,9 +63,9 @@ with st.sidebar:
 def call_groq_llm(api_key, prompt):
     client = Groq(api_key=api_key)
     response = client.chat.completions.create(
-        model="openai/gpt-oss-20b",  # <--- Active Groq model ID
+        model="llama-3.1-8b-instant",
         messages=[
-            {"role": "system", "content": "You are an elite academic assessment builder. Respond strictly with clean output."},
+            {"role": "system", "content": "You are an elite academic assessment builder. Respond strictly with valid raw JSON format when requested, without extra conversational filler."},
             {"role": "user", "content": prompt}
         ],
         temperature=0.3
@@ -102,7 +108,7 @@ def run_jit_generation(config_id, api_key):
             Based on this section matrix breakdown (incorporating target difficulty levels like Easy/Moderate/High): {json.dumps(matrix_specs)}.
             Ensure unique wording to prevent cheating. Return ONLY a raw valid JSON array format and nothing else:
             [
-              {
+              {{
                 "id": "q1",
                 "chapter": "Chapter Name",
                 "level": "Moderate",
@@ -111,7 +117,7 @@ def run_jit_generation(config_id, api_key):
                 "options": ["A", "B", "C", "D"],
                 "correct": "A",
                 "marks": 2
-              }
+              }}
             ]
             """
             raw_text = call_groq_llm(api_key, prompt)
@@ -232,8 +238,9 @@ if role == "Teacher Dashboard":
     col_s1, col_s2 = st.columns(2)
     with col_s1: num_sets = st.slider("Parallel Anti-Cheating Randomized Sets", 1, 4, 3)
     with col_s2:
-        exam_date = st.date_input("Exam Date", value=datetime.now().date())
-        exam_time = st.time_input("Exam Start Time", value=datetime.now().time())
+        current_ist = get_ist_now()
+        exam_date = st.date_input("Exam Date", value=current_ist.date())
+        exam_time = st.time_input("Exam Start Time", value=current_ist.time())
         
     scheduled_dt_str = f"{exam_date} {exam_time}"
     
@@ -284,6 +291,7 @@ elif role == "Student Examination Portal":
         if config_row:
             cat, b_stream, grd, subj, matrix_json, n_sets, exam_time_str, is_generated = config_row
             
+            # Instant JIT Generation fallback if sets aren't synthesized yet
             if is_generated == 0 and api_key_input:
                 run_jit_generation(input_config_id, api_key_input)
                 config_row = fetch_config(input_config_id)
@@ -349,7 +357,7 @@ elif role == "Student Examination Portal":
                                     conn = get_db_connection()
                                     c = conn.cursor()
                                     c.execute("INSERT INTO submissions (student, set_id, score, total_marks, student_answers, agent_report, submitted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                              (student_name.strip(), set_id, score, total_marks, json.dumps(student_answers), agent_report, str(datetime.now())))
+                                              (student_name.strip(), set_id, score, total_marks, json.dumps(student_answers), agent_report, str(get_ist_now())))
                                     conn.commit()
                                     conn.close()
                                     
