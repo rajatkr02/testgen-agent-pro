@@ -57,9 +57,9 @@ with st.sidebar:
 def call_groq_llm(api_key, prompt):
     client = Groq(api_key=api_key)
     response = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
+        model="openai/gpt-oss-20b",  # <--- Active Groq model ID
         messages=[
-            {"role": "system", "content": "You are an elite academic assessment builder. Respond strictly with valid raw JSON format when requested, without extra conversational filler."},
+            {"role": "system", "content": "You are an elite academic assessment builder. Respond strictly with clean output."},
             {"role": "user", "content": prompt}
         ],
         temperature=0.3
