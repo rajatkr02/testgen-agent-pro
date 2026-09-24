@@ -4,7 +4,7 @@ import json
 import random
 import pandas as pd
 from datetime import datetime, timedelta
-from google import genai
+from groq import Groq
 
 # --- PAGE CONFIGURATION ---
 st.set_page_config(
@@ -44,14 +44,27 @@ def get_db_connection():
 # --- SIDEBAR CONFIGURATION ---
 with st.sidebar:
     st.title("TestGen-Agent")
-    st.caption("Autonomous Academic Intelligence (POC)")
+    st.caption("Autonomous Academic Intelligence (Groq Powered)")
     st.markdown("---")
-    api_key_input = st.text_input("🔑 Gemini API Key", type="password", help="Enter your Gemini API key.")
+    api_key_input = st.text_input("🔑 Groq API Key", type="password", help="Enter your free Groq API key from console.groq.com")
     st.markdown("---")
     role = st.selectbox(
         "🧭 Navigation Portal", 
         ["Teacher Dashboard", "Student Examination Portal", "Analytics & Reports Hub", "Live Database Inspector"]
     )
+
+# --- GROQ HELPER FUNCTION ---
+def call_groq_llm(api_key, prompt):
+    client = Groq(api_key=api_key)
+    response = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[
+            {"role": "system", "content": "You are an elite academic assessment builder. Respond strictly with clean output."},
+            {"role": "user", "content": prompt}
+        ],
+        temperature=0.3
+    )
+    return response.choices[0].message.content.strip()
 
 # --- JIT GENERATION HELPER ---
 def run_jit_generation(config_id, api_key):
@@ -68,7 +81,6 @@ def run_jit_generation(config_id, api_key):
     scheduled_dt = datetime.strptime(exam_time_str, "%Y-%m-%d %H:%M:%S")
     
     try:
-        client = genai.Client(api_key=api_key)
         matrix_specs = json.loads(matrix_json)
         
         for i in range(n_sets):
@@ -76,10 +88,10 @@ def run_jit_generation(config_id, api_key):
             set_id = f"{subj[:3].upper()}_{set_name}_{random.randint(1111,9999)}"
             
             prompt = f"""
-            You are an elite AI assessment builder. Create a rigorous academic question paper set ({set_name}) adhering strictly to:
+            Create a rigorous academic question paper set ({set_name}) adhering strictly to:
             Category: {cat}, Stream/Board: {b_stream}, Grade: {grd}, Subject: {subj}.
             Based on this section matrix breakdown: {json.dumps(matrix_specs)}.
-            Ensure unique wording to prevent cheating. Return ONLY a raw JSON array format:
+            Ensure unique wording to prevent cheating. Return ONLY a raw valid JSON array format and nothing else:
             [
               {{
                 "id": "q1",
@@ -92,8 +104,7 @@ def run_jit_generation(config_id, api_key):
               }}
             ]
             """
-            response = client.models.generate_content(model='gemini-3.5-flash', contents=prompt)
-            raw_text = response.text.strip()
+            raw_text = call_groq_llm(api_key, prompt)
             if raw_text.startswith("```json"): raw_text = raw_text[7:-3].strip()
             elif raw_text.startswith("```"): raw_text = raw_text[3:-3].strip()
             
@@ -146,13 +157,11 @@ if role == "Teacher Dashboard":
     st.markdown("### 📚 Subject Discovery & Mapping")
     sub_col1, sub_col2 = st.columns([3, 1])
     with sub_col1:
-        if api_key_input and st.button("🤖 Discover Official Subjects via Gemini"):
+        if api_key_input and st.button("🤖 Discover Official Subjects via Groq"):
             with st.spinner("Querying board frameworks..."):
                 try:
-                    client = genai.Client(api_key=api_key_input)
                     prompt = f"List official core subjects for Category: {category}, Board/Stream: {board_stream}, Level: {grade}. Return ONLY a raw JSON array of strings: [\"Subject 1\", \"Subject 2\"]."
-                    res = client.models.generate_content(model='gemini-3.5-flash', contents=prompt)
-                    clean_res = res.text.strip()
+                    clean_res = call_groq_llm(api_key_input, prompt)
                     if clean_res.startswith("```json"): clean_res = clean_res[7:-3].strip()
                     elif clean_res.startswith("```"): clean_res = clean_res[3:-3].strip()
                     st.session_state.fetched_subjects = json.loads(clean_res)
@@ -170,14 +179,12 @@ if role == "Teacher Dashboard":
     if api_key_input and st.button("✨ Auto-Populate Matrix"):
         with st.spinner("Extracting standard syllabus matrix..."):
             try:
-                client = genai.Client(api_key=api_key_input)
                 prompt = f"""
                 Provide official chapters and key topic units for Board: {board_stream}, Grade: {grade}, Subject: {subject}.
                 Return ONLY a raw JSON array of objects with keys 'chapter' and 'topics' (as a comma-separated string):
                 [{{"chapter": "Chapter Name 1", "topics": "Topic A, Topic B"}}]
                 """
-                res = client.models.generate_content(model='gemini-3.5-flash', contents=prompt)
-                clean_res = res.text.strip()
+                clean_res = call_groq_llm(api_key_input, prompt)
                 if clean_res.startswith("```json"): clean_res = clean_res[7:-3].strip()
                 elif clean_res.startswith("```"): clean_res = clean_res[3:-3].strip()
                 discovered_matrix = json.loads(clean_res)
@@ -226,32 +233,33 @@ if role == "Teacher Dashboard":
     b_col1, b_col2 = st.columns(2)
     with b_col1:
         if st.button("🚀 Schedule Exam Blueprint", type="primary"):
-            if not api_key_input: st.error("API Key required.")
+            if not api_key_input: st.error("Groq API Key required.")
             else:
                 config_id = f"CFG_{subject[:3].upper()}_{random.randint(1000,9999)}"
                 conn = get_db_connection()
                 c = conn.cursor()
+                # Fixed 8-column explicit insert to prevent operational errors
                 c.execute(
-    "INSERT OR REPLACE INTO paper_configs (config_id, category, board_stream, grade, subject, matrix_data, num_sets, exam_time, generated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
-    (config_id, category, board_stream, grade, subject, json.dumps(matrix_input_data), num_sets, scheduled_dt_str)
-)
+                    "INSERT OR REPLACE INTO paper_configs (config_id, category, board_stream, grade, subject, matrix_data, num_sets, exam_time, generated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                    (config_id, category, board_stream, grade, subject, json.dumps(matrix_input_data), num_sets, scheduled_dt_str)
+                )
                 conn.commit()
                 conn.close()
                 st.success(f"✅ Config scheduled! Copy this Config ID for students: **{config_id}**")
     with b_col2:
         if st.button("⚡ Force Generate & Lock Sets Now"):
-            if not api_key_input: st.error("API Key required.")
+            if not api_key_input: st.error("Groq API Key required.")
             else:
                 config_id = f"CFG_{subject[:3].upper()}_{random.randint(1000,9999)}"
                 conn = get_db_connection()
                 c = conn.cursor()
                 c.execute(
-    "INSERT OR REPLACE INTO paper_configs (config_id, category, board_stream, grade, subject, matrix_data, num_sets, exam_time, generated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
-    (config_id, category, board_stream, grade, subject, json.dumps(matrix_input_data), num_sets, scheduled_dt_str)
-)
+                    "INSERT OR REPLACE INTO paper_configs (config_id, category, board_stream, grade, subject, matrix_data, num_sets, exam_time, generated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)",
+                    (config_id, category, board_stream, grade, subject, json.dumps(matrix_input_data), num_sets, scheduled_dt_str)
+                )
                 conn.commit()
                 conn.close()
-                with st.spinner("Synthesizing multi-set question banks..."):
+                with st.spinner("Synthesizing multi-set question banks with Groq..."):
                     success, msg = run_jit_generation(config_id, api_key_input)
                     if success: st.success(f"🔥 Successfully generated! Copy this Config ID: **{config_id}**")
                     else: st.error(f"Generation error: {msg}")
@@ -312,7 +320,7 @@ elif role == "Student Examination Portal":
                                     
                             submitted_exam = st.form_submit_button("📤 Submit Final Examination", type="primary")
                             if submitted_exam:
-                                if not api_key_input: st.error("API Key required.")
+                                if not api_key_input: st.error("Groq API Key required.")
                                 else:
                                     with st.spinner("Evaluating submissions..."):
                                         score = 0
@@ -323,10 +331,8 @@ elif role == "Student Examination Portal":
                                                 score += q['marks']
                                                 
                                         try:
-                                            client = genai.Client(api_key=api_key_input)
                                             eval_prompt = f"Analyze this student exam submission: Student: {student_name}, Score: {score}/{total_marks}. Provide a detailed diagnostic report in clear markdown."
-                                            eval_res = client.models.generate_content(model='gemini-3.5-flash', contents=eval_prompt)
-                                            agent_report = eval_res.text
+                                            agent_report = call_groq_llm(api_key_input, eval_prompt)
                                         except Exception:
                                             agent_report = "Deterministic evaluation report compiled successfully."
                                             
@@ -381,4 +387,3 @@ elif role == "Live Database Inspector":
         st.info(f"Table `{table_choice}` is currently empty. Run an action in the Teacher or Student portal first!")
     finally:
         conn.close()
-    
