@@ -241,10 +241,12 @@ if role == "Teacher Dashboard":
                 st.error(f"Mapping failed: {e}")
 
     if "matrix_rows" not in st.session_state:
-        default_ch = "काव्य खंड एवं गद्य खंड" if ("Hindi" in exam_language or "Sanskrit" in exam_language) else "Introduction & Fundamentals"
-        st.session_state.matrix_rows = [{"chapter": default_ch, "topics": "Basic Concepts, Core Principles", "level": "Moderate", "q_type": "MCQ", "count": 2, "marks": 2}]
+        st.session_state.matrix_rows = []
 
     matrix_input_data = []
+    if not st.session_state.matrix_rows:
+        st.info("💡 No chapters added yet. Click **'Auto-Populate Matrix'** above or **'Add Section Row'** below to build your blueprint.")
+    
     for idx, row in enumerate(st.session_state.matrix_rows):
         cols = st.columns([2, 3, 2, 1, 1, 1, 1])
         with cols[0]: ch = st.text_input(f"Chapter {idx+1}", value=row["chapter"], key=f"ch_{idx}")
@@ -257,9 +259,8 @@ if role == "Teacher Dashboard":
             st.write("")
             st.write("")
             if st.button("🗑️", key=f"del_{idx}"):
-                if len(st.session_state.matrix_rows) > 1:
-                    st.session_state.matrix_rows.pop(idx)
-                    st.rerun()
+                st.session_state.matrix_rows.pop(idx)
+                st.rerun()
         matrix_input_data.append({"chapter": ch, "topics": tp, "level": lvl, "q_type": qt, "count": cnt, "marks": mks})
 
     if st.button("➕ Add Section Row"):
@@ -280,13 +281,14 @@ if role == "Teacher Dashboard":
     with b_col1:
         if st.button("🚀 Schedule Exam Blueprint", type="primary"):
             if not api_key_input: st.error("Groq API Key required.")
+            elif not st.session_state.matrix_rows: st.error("Please add at least one chapter row to the matrix.")
             else:
                 config_id = f"CFG_{subject[:3].upper()}_{random.randint(1000,9999)}"
                 conn = get_db_connection()
                 c = conn.cursor()
                 c.execute(
-                    "INSERT OR REPLACE INTO paper_configs (config_id, category, board_stream, grade, subject, language, matrix_data, num_sets, exam_time, generated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
-                    (config_id, category, board_stream, grade, subject, exam_language, json.dumps(matrix_input_data, ensure_ascii=False), num_sets, scheduled_dt_str)
+                    "INSERT OR REPLACE INTO paper_configs (config_id, category, board_stream, grade, subject, language, matrix_data, num_sets, exam_time, generated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (config_id, category, board_stream, grade, subject, exam_language, json.dumps(matrix_input_data, ensure_ascii=False), num_sets, scheduled_dt_str, 0)
                 )
                 conn.commit()
                 conn.close()
@@ -294,13 +296,14 @@ if role == "Teacher Dashboard":
     with b_col2:
         if st.button("⚡ Force Generate & Lock Sets Now"):
             if not api_key_input: st.error("Groq API Key required.")
+            elif not st.session_state.matrix_rows: st.error("Please add at least one chapter row to the matrix.")
             else:
                 config_id = f"CFG_{subject[:3].upper()}_{random.randint(1000,9999)}"
                 conn = get_db_connection()
                 c = conn.cursor()
                 c.execute(
-                    "INSERT OR REPLACE INTO paper_configs (config_id, category, board_stream, grade, subject, language, matrix_data, num_sets, exam_time, generated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0)",
-                    (config_id, category, board_stream, grade, subject, exam_language, json.dumps(matrix_input_data, ensure_ascii=False), num_sets, scheduled_dt_str)
+                    "INSERT OR REPLACE INTO paper_configs (config_id, category, board_stream, grade, subject, language, matrix_data, num_sets, exam_time, generated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (config_id, category, board_stream, grade, subject, exam_language, json.dumps(matrix_input_data, ensure_ascii=False), num_sets, scheduled_dt_str, 0)
                 )
                 conn.commit()
                 conn.close()
