@@ -31,23 +31,31 @@ IST = timezone(timedelta(hours=5, minutes=30))
 def get_ist_now():
     return datetime.now(IST)
 
-# --- LOCAL SQLITE DATABASE INITIALIZATION & MIGRATION ---
+# --- LOCAL SQLITE DATABASE INITIALIZATION & ROBUST MIGRATION ---
 def init_db():
     conn = sqlite3.connect("exam_platform_poc.db", check_same_thread=False)
     c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS paper_configs 
-                 (config_id TEXT PRIMARY KEY, category TEXT, board_stream TEXT, grade TEXT, subject TEXT, language TEXT, matrix_data TEXT, num_sets INTEGER, exam_time TEXT, generated INT)''')
     
-    # Safe migration: add 'generated' column if migrating from an older DB version
-    try:
-        c.execute("ALTER TABLE paper_configs ADD COLUMN generated INT DEFAULT 0")
-    except sqlite3.OperationalError:
-        pass # Column already exists
-        
+    # Create tables if they don't exist
+    c.execute('''CREATE TABLE IF NOT EXISTS paper_configs 
+                 (config_id TEXT PRIMARY KEY, category TEXT, board_stream TEXT, grade TEXT, subject TEXT, language TEXT, matrix_data TEXT, num_sets INTEGER, exam_time TEXT, generated INT DEFAULT 0)''')
+                 
     c.execute('''CREATE TABLE IF NOT EXISTS paper_sets 
                  (set_id TEXT PRIMARY KEY, config_id TEXT, set_name TEXT, data TEXT, unlock_time TEXT, expires_at TEXT)''')
+                 
     c.execute('''CREATE TABLE IF NOT EXISTS submissions 
                  (id INTEGER PRIMARY KEY AUTOINCREMENT, student TEXT, set_id TEXT, score REAL, total_marks REAL, student_answers TEXT, agent_report TEXT, submitted_at TEXT)''')
+
+    # Robust migration: Check existing columns in paper_configs and add missing ones if upgrading from older DB versions
+    c.execute("PRAGMA table_info(paper_configs)")
+    existing_columns = [col[1] for col in c.fetchall()]
+    
+    if "generated" not in existing_columns:
+        try:
+            c.execute("ALTER TABLE paper_configs ADD COLUMN generated INT DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+            
     conn.commit()
     conn.close()
 
