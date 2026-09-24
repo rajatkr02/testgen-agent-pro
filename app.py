@@ -67,7 +67,7 @@ def call_groq_llm(api_key, prompt):
     response = client.chat.completions.create(
         model="openai/gpt-oss-20b",
         messages=[
-            {"role": "system", "content": "You are an elite academic assessment builder. Respond strictly with raw valid JSON only."},
+            {"role": "system", "content": "You are an elite academic assessment builder. Respond strictly with raw valid JSON or structured Markdown as requested."},
             {"role": "user", "content": prompt}
         ],
         temperature=0.3,
@@ -363,11 +363,10 @@ elif role == "Student Examination Portal":
                     with st.form("student_live_exam"):
                         student_answers = {}
                         for idx, q in enumerate(questions):
-                            # Clean variable extraction to prevent f-string quote nesting syntax issues
                             q_chapter = q.get('chapter', 'General')
                             q_level = q.get('level', 'Moderate')
                             q_text = q.get('q', '')
-                            q_marks = q.get('marks', 1)
+                            q_marks = int(q.get('marks', 1))
                             
                             st.markdown(f"**Q{idx+1}. [{q_chapter} | *{q_level}*] {q_text}** *({q_marks} Marks)*")
                             
@@ -381,19 +380,58 @@ elif role == "Student Examination Portal":
                         if submitted_exam:
                             if not api_key_input: st.error("Groq API Key required.")
                             else:
-                                with st.spinner("Evaluating submissions..."):
+                                with st.spinner("Evaluating submissions and generating detailed diagnostic report..."):
                                     score = 0
                                     total_marks = 0
-                                    for q in questions:
-                                        total_marks += q['marks']
-                                        if str(student_answers.get(q['id'])).strip().lower() == str(q['correct']).strip().lower():
-                                            score += q['marks']
+                                    evaluation_breakdown = []
+                                    
+                                    for idx, q in enumerate(questions):
+                                        q_marks = int(q.get('marks', 1))
+                                        total_marks += q_marks
+                                        user_ans = str(student_answers.get(q['id'])).strip()
+                                        correct_ans = str(q['correct']).strip()
+                                        is_correct = user_ans.lower() == correct_ans.lower()
+                                        if is_correct:
+                                            score += q_marks
+                                        
+                                        evaluation_breakdown.append(
+                                            f"- **Q{idx+1} ({q.get('chapter', 'General')}):** Given: `{user_ans}` | Correct: `{correct_ans}` | Result: {'✅ Correct' if is_correct else '❌ Incorrect'}"
+                                        )
                                             
                                     try:
-                                        eval_prompt = f"Analyze this student exam submission: Student: {student_name}, Score: {score}/{total_marks}. Provide a detailed diagnostic report in clear markdown."
+                                        eval_prompt = f"""
+                                        Analyze this student exam submission thoroughly and provide a comprehensive diagnostic evaluation report in rich markdown:
+                                        Student Name: {student_name}
+                                        Score: {score} out of {total_marks} ({score/total_marks*100:.1f}%)
+                                        Question Details & Answers:
+                                        {chr(10).join(evaluation_breakdown)}
+
+                                        Include sections:
+                                        1. Executive Summary & Performance Grade
+                                        2. Strengths & Topic Mastery
+                                        3. Areas for Improvement & Conceptual Gaps
+                                        4. Actionable Study Recommendations
+                                        """
                                         agent_report = call_groq_llm(api_key_input, eval_prompt)
-                                    except Exception:
-                                        agent_report = "Deterministic evaluation report compiled successfully."
+                                    except Exception as e:
+                                        # Detailed robust fallback markdown report if LLM call fails
+                                        agent_report = f"""
+### 📋 Detailed Diagnostic Evaluation Report
+
+* **Student Name:** {student_name}
+* **Final Score:** **{score} / {total_marks}** ({score/total_marks*100:.1f}%)
+* **Status:** Evaluated Successfully
+
+---
+
+#### 🔍 Question-by-Question Breakdown
+{chr(10).join(evaluation_breakdown)}
+
+---
+
+#### 💡 Performance Summary
+The student completed the assessment set. Review the incorrect responses above to identify specific chapters requiring targeted revision.
+                                        """
                                         
                                     conn = get_db_connection()
                                     c = conn.cursor()
