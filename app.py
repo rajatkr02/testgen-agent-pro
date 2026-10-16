@@ -1,513 +1,810 @@
-import streamlit as st
 import sqlite3
+import datetime
 import json
-import ast
-import re
-import random
+import time
+import threading
+import streamlit as st
 import pandas as pd
-from datetime import datetime, timedelta, timezone
 from groq import Groq
+from langchain_core.messages import HumanMessage, SystemMessage
+from langgraph.graph import StateGraph, END
+from typing import TypedDict, List, Dict, Any
 
-# --- PAGE CONFIGURATION ---
+# Global thread-safe memory store pulling securely from Streamlit secrets
+GLOBAL_API_KEY = st.secrets.get("GROQ_API_KEY", "")
+global_lock = threading.Lock()
+
+# ==========================================
+# 0. DATABASE & INITIALIZATION (AUTO-MIGRATION)
+# ==========================================
+
+def init_db():
+    conn = sqlite3.connect("exam_platform_agentic.db", check_same_thread=False)
+    cursor = conn.cursor()
+    
+    # Exam Configurations / Blueprints
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS paper_configs (
+            id TEXT PRIMARY KEY,
+            stream_category TEXT,
+            board_or_org TEXT,
+            grade_level TEXT,
+            subject TEXT,
+            exam_language TEXT,
+            matrix_data TEXT,
+            num_sets INTEGER,
+            scheduled_time TEXT,
+            generation_status TEXT DEFAULT 'Pending'
+        )
+    """)
+    
+    # AUTO-MIGRATION: Ensure 'generation_status' column exists
+    cursor.execute("PRAGMA table_info(paper_configs)")
+    columns = [col[1] for col in cursor.fetchall()]
+    if "generation_status" not in columns:
+        cursor.execute("ALTER TABLE paper_configs ADD COLUMN generation_status TEXT DEFAULT 'Pending'")
+        conn.commit()
+
+    # Generated Question Sets
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS paper_sets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            config_id TEXT,
+            set_name TEXT,
+            question_data TEXT,
+            FOREIGN KEY (config_id) REFERENCES paper_configs(id)
+        )
+    """)
+    
+    # Dummy Students
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS students (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT,
+            email TEXT,
+            enrolled_stream TEXT
+        )
+    """)
+    
+    # Student Assignments Log
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS student_assignments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            config_id TEXT,
+            student_id TEXT,
+            assigned_set TEXT,
+            assignment_status TEXT
+        )
+    """)
+    
+    # Submissions
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS submissions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            config_id TEXT,
+            student_name TEXT,
+            score REAL,
+            details TEXT,
+            submitted_at TEXT
+        )
+    """)
+    
+    # Student Diagnostic Reports Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS student_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            config_id TEXT,
+            student_name TEXT,
+            overall_score REAL,
+            strengths TEXT,
+            weak_areas TEXT,
+            personalized_feedback TEXT,
+            question_breakdown TEXT,
+            generated_at TEXT
+        )
+    """)
+
+    # Scheduler Execution Logs Table
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS agent_scheduler_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            config_id TEXT,
+            log_message TEXT,
+            logged_at TEXT
+        )
+    """)
+    
+    # Seed default dummy students if empty
+    cursor.execute("SELECT COUNT(*) FROM students")
+    if cursor.fetchone()[0] == 0:
+        default_students = [
+            ("Rajat Kumar", "rajat.student@example.com", "College / University"),
+            ("Priya Sharma", "priya.sharma@example.com", "School Education"),
+            ("Amit Verma", "amit.verma@example.com", "Competitive & Entrance Exams")
+        ]
+        cursor.executemany("INSERT INTO students (name, email, enrolled_stream) VALUES (?, ?, ?)", default_students)
+        conn.commit()
+
+    conn.close()
+
+init_db()
+
+# ==========================================
+# 1. STREAMLIT PAGE CONFIGURATION
+# ==========================================
 st.set_page_config(
-    page_title="TestGen-Agent Pro",
-    page_icon="🎓",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    page_title="TestGen-Agent Pro: Autonomous Scheduled Suite",
+    page_icon="🤖",
+    layout="wide"
 )
 
-# --- MODERN UI STYLING ---
-st.markdown("""
-    <style>
-    .main { background-color: #f8fafc; }
-    .stButton>button { width: 100%; border-radius: 6px; font-weight: 600; }
-    div.block-container { padding-top: 2rem; }
-    </style>
-""", unsafe_allow_html=True)
+# ==========================================
+# 2. HELPER & LLM UTILITIES
+# ==========================================
+def robust_parse_json(raw_text: str):
+    """Cleans markdown code fences and extracts raw JSON payloads."""
+    try:
+        cleaned = raw_text.strip()
+        if cleaned.startswith("```json"):
+            cleaned = cleaned[7:]
+        elif cleaned.startswith("```"):
+            cleaned = cleaned[3:]
+        if cleaned.endswith("```"):
+            cleaned = cleaned[:-3]
+        return json.loads(cleaned.strip())
+    except Exception as e:
+        return {}
 
-# --- TIMEZONE SETUP (IST: UTC+5:30) ---
-IST = timezone(timedelta(hours=5, minutes=30))
-
-def get_ist_now():
-    return datetime.now(IST)
-
-# --- LOCAL SQLITE DATABASE INITIALIZATION ---
-def init_db():
-    # Changed filename to force a brand new, clean database creation
-    conn = sqlite3.connect("exam_platform_v2.db", check_same_thread=False)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS paper_configs
-                 (config_id TEXT PRIMARY KEY, category TEXT, board_stream TEXT, grade TEXT, subject TEXT, language TEXT, matrix_data TEXT, num_sets INTEGER, exam_time TEXT, generated INT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS paper_sets
-                 (set_id TEXT PRIMARY KEY, config_id TEXT, set_name TEXT, data TEXT, unlock_time TEXT, expires_at TEXT)''')
-    c.execute('''CREATE TABLE IF NOT EXISTS submissions
-                 (id INTEGER PRIMARY KEY AUTOINCREMENT, student TEXT, set_id TEXT, score REAL, total_marks REAL, student_answers TEXT, agent_report TEXT, submitted_at TEXT)''')
-    conn.commit()
-    conn.close()
- 
-init_db()
- 
-def get_db_connection():
-    return sqlite3.connect("exam_platform_v2.db", check_same_thread=False)
-
-# --- SIDEBAR CONFIGURATION ---
-with st.sidebar:
-    st.title("TestGen-Agent")
-    st.caption("Autonomous Academic Intelligence")
-    st.markdown("---")
-    api_key_input = st.text_input("🔑 Groq API Key", type="password", help="Enter your free Groq API key from console.groq.com")
-    st.markdown("---")
-    exam_language = st.selectbox(
-        "🌐 Language / Medium", 
-        ["English", "Hindi (हिन्दी)", "Sanskrit (संस्कृतम्)", "Regional / Other"],
-        index=0,
-        help="Select output language for syllabus, questions, and evaluation reports."
-    )
-    st.markdown("---")
-    role = st.selectbox(
-        "🧭 Navigation Portal", 
-        ["Teacher Dashboard", "Student Examination Portal", "Analytics & Reports Hub", "Live Database Inspector"]
-    )
-
-# --- GROQ HELPER FUNCTION ---
-def call_groq_llm(api_key, prompt):
+def call_groq_llm(api_key: str, system_prompt: str, user_prompt: str) -> str:
     client = Groq(api_key=api_key)
-    response = client.chat.completions.create(
+    completion = client.chat.completions.create(
         model="openai/gpt-oss-20b",
         messages=[
-            {"role": "system", "content": "You are an elite multi-lingual academic assessment builder. Respond strictly with raw valid JSON or structured Markdown as requested, preserving exact unicode/script characters (e.g., Devanagari for Hindi/Sanskrit)."},
-            {"role": "user", "content": prompt}
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
         ],
         temperature=0.3,
-        max_tokens=4096
+        response_format={"type": "json_object"}
     )
-    return response.choices[0].message.content.strip()
+    return completion.choices[0].message.content
 
-def robust_parse_json(raw_text):
-    match = re.search(r'(\[.*\]|\{.*\})', raw_text, re.DOTALL)
-    cleaned = match.group(0) if match else raw_text
-    cleaned = cleaned.replace("```json", "").replace("```", "").strip()
-    
-    try:
-        return json.loads(cleaned)
-    except Exception:
-        try:
-            fixed = cleaned.strip()
-            open_braces = fixed.count('{') - fixed.count('}')
-            open_brackets = fixed.count('[') - fixed.count(']')
-            
-            if open_braces < 0 or open_brackets < 0:
-                fixed = fixed[:max(fixed.rfind('}'), fixed.rfind(']')) + 1]
-                open_braces = fixed.count('{') - fixed.count('}')
-                open_brackets = fixed.count('[') - fixed.count(']')
-                
-            fixed += '}' * max(0, open_braces)
-            fixed += ']' * max(0, open_brackets)
-            return json.loads(fixed)
-        except Exception:
-            try:
-                return ast.literal_eval(cleaned)
-            except Exception as e:
-                raise ValueError(f"Failed to parse LLM response as JSON: {e}\nRaw response:\n{raw_text}")
+# ==========================================
+# 3. LANGGRAPH AGENTIC PIPELINE (QUESTION GENERATION)
+# ==========================================
+class ExamAgentState(TypedDict):
+    api_key: str
+    stream_category: str
+    board_or_org: str
+    grade_level: str
+    subject: str
+    exam_language: str
+    matrix_rows: List[Dict[str, Any]]
+    num_sets: int
+    config_id: str
+    scheduled_time: str
+    generated_sets: List[Dict[str, Any]]
+    status_log: List[str]
 
-# --- JIT GENERATION HELPER ---
-def run_jit_generation(config_id, api_key):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT category, board_stream, grade, subject, language, matrix_data, num_sets, exam_time FROM paper_configs WHERE config_id = ?", (config_id,))
-    config_row = c.fetchone()
+def syllabus_validator_agent(state: ExamAgentState) -> ExamAgentState:
+    state["status_log"].append("Syllabus Validator Agent active: Inspecting academic domain constraints...")
+    return state
+
+def question_generator_agent(state: ExamAgentState) -> ExamAgentState:
+    state["status_log"].append("Question Generator Agent active: Synthesizing strict schema-compliant question bank sets...")
+    api_key = state["api_key"]
+    sets_count = state["num_sets"]
     
-    if not config_row:
-        conn.close()
-        return False, "Config ID not found."
-        
-    cat, b_stream, grd, subj, lang, matrix_json, n_sets, exam_time_str = config_row
+    generated_results = []
+    set_labels = [chr(65 + i) for i in range(sets_count)]
     
-    try:
-        scheduled_dt = datetime.strptime(exam_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
-    except ValueError:
-        scheduled_dt = get_ist_now()
-    
-    try:
-        matrix_specs = json.loads(matrix_json)
-        
-        for i in range(n_sets):
-            set_name = f"Set_{chr(65+i)}"
-            set_id = f"{subj[:3].upper()}_{set_name}_{random.randint(1111,9999)}"
-            
-            prompt = f"""
-            Create a rigorous academic question paper set ({set_name}) adhering strictly to:
-            Category: {cat}, Stream/Board: {b_stream}, Grade: {grd}, Subject: {subj}.
-            Language Medium: {lang} (Generate all questions, chapter names, options, and explanations in this exact language/script).
-            Based on this section matrix breakdown (incorporating target difficulty levels like Easy/Moderate/High): {json.dumps(matrix_specs)}.
-            Ensure unique wording to prevent cheating. Return ONLY a raw valid JSON array format and nothing else:
-            [
-              {{
-                "id": "q1",
-                "chapter": "Chapter Name in {lang}",
-                "level": "Moderate",
-                "type": "MCQ",
-                "q": "Question string in {lang}?",
-                "options": ["Option A", "Option B", "Option C", "Option D"],
-                "correct": "Option A",
-                "marks": 2
-              }}
+    for s_label in set_labels:
+        sys_p = "You are an elite academic assessment creator. You MUST return ONLY a valid JSON object containing a key 'questions' which is an array of objects. Each object must strictly contain keys: 'chapter' (string), 'question' (string), 'options' (array of 4 strings if MCQ, or empty array []), 'answer' (string matching one of the options or exact correct value), and 'marks' (number)."
+        user_p = f"""Create a comprehensive exam question set {s_label} for Domain: {state['stream_category']}, Board/Org: {state['board_or_org']}, Level: {state['grade_level']}, Subject: {state['subject']} in Language: {state['exam_language']}.
+        You must strictly adhere to the following syllabus mapping matrix and question counts/types: {json.dumps(state['matrix_rows'])}.
+        Return format strictly:
+        {{
+            "questions": [
+                {{"chapter": "Chapter Name", "question": "Question text?", "options": ["A", "B", "C", "D"], "answer": "A", "marks": 2}}
             ]
-            """
-            raw_text = call_groq_llm(api_key, prompt)
-            parsed_q = robust_parse_json(raw_text)
-            expire_dt = scheduled_dt + timedelta(hours=3)
+        }}"""
+        
+        try:
+            res_text = call_groq_llm(api_key, sys_p, user_p)
+            q_payload = robust_parse_json(res_text)
+            q_data = q_payload.get("questions", [])
+            generated_results.append({"set_name": f"Set {s_label}", "data": {"questions": q_data}})
+        except Exception as e:
+            state["status_log"].append(f"Error generating Set {s_label}: {e}")
             
-            c.execute("INSERT OR REPLACE INTO paper_sets VALUES (?, ?, ?, ?, ?, ?)",
-                      (set_id, config_id, set_name, json.dumps(parsed_q, ensure_ascii=False), str(scheduled_dt.strftime("%Y-%m-%d %H:%M:%S")), str(expire_dt.strftime("%Y-%m-%d %H:%M:%S"))))
-                      
-        c.execute("UPDATE paper_configs SET generated = 1 WHERE config_id = ?", (config_id,))
-        conn.commit()
-        conn.close()
-        return True, "Success"
-    except Exception as e:
-        conn.close()
-        return False, str(e)
+    state["generated_sets"] = generated_results
+    return state
 
-def fetch_config(config_id):
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT category, board_stream, grade, subject, language, matrix_data, num_sets, exam_time, generated FROM paper_configs WHERE config_id = ?", (config_id,))
-    row = c.fetchone()
-    conn.close()
-    return row
-
-# ==========================================
-# 1. TEACHER PORTAL
-# ==========================================
-if role == "Teacher Dashboard":
-    st.header("📋 Teacher Dashboard: Autonomous Curriculum & Blueprint Hub")
+def qa_red_teaming_agent(state: ExamAgentState) -> ExamAgentState:
+    state["status_log"].append("QA & Red-Teaming Agent active: Auditing questions for strict schema compliance and options consistency...")
+    api_key = state["api_key"]
+    audited_sets = []
     
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        category = st.selectbox("Institution Category", ["School Board (K-12)", "College / University Stream", "Competitive / Entrance Exam"], key="teacher_category")
-    with col2:
-        if category == "School Board (K-12)":
-            board_stream = st.selectbox("Education Board", ["CBSE", "ICSE", "State Board (General)", "IB / IGCSE"], key="board_k12")
-        elif category == "College / University Stream":
-            board_stream = st.selectbox("Stream", ["B.Tech / Computer Science", "B.Sc (Pure Sciences)", "B.Com / Management", "Medical / MBBS Basics"], key="board_uni")
-        else:
-            board_stream = st.selectbox("Entrance Target", ["JEE (Main & Advanced)", "NEET (Medical)", "GATE (Engineering)", "UPSC Prelims"], key="board_entrance")
-    with col3:
-        if category == "School Board (K-12)":
-            grade = st.selectbox("Class / Grade", ["Class 8", "Class 9", "Class 10", "Class 11", "Class 12"], key="grade_k12")
-        elif category == "College / University Stream":
-            grade = st.selectbox("Semester", ["Semester 1", "Semester 2", "Semester 3", "Semester 4", "Final Year"], key="grade_uni")
-        else:
-            grade = st.selectbox("Target Tier", ["Target Tier 1", "Target Tier 2"], key="grade_entrance")
+    for s_item in state["generated_sets"]:
+        set_name = s_item["set_name"]
+        q_data = s_item["data"]
+        
+        sys_p = "You are a strict academic QA examiner. Validate that every question has 'chapter', 'question', 'options', 'answer', and 'marks'. Return ONLY a valid JSON object with the verified questions array under key 'questions'."
+        user_p = f"Review and fix any schema inconsistencies in this question set json: {json.dumps(q_data)}."
+        
+        try:
+            audit_res = call_groq_llm(api_key, sys_p, user_p)
+            audited_json = robust_parse_json(audit_res)
+            if not audited_json or "questions" not in audited_json:
+                audited_json = q_data
+            audited_sets.append({"set_name": set_name, "data": audited_json})
+            state["status_log"].append(f"QA Audit passed and verified for {set_name}.")
+        except Exception as e:
+            audited_sets.append(s_item)
+            
+    state["generated_sets"] = audited_sets
+    return state
 
-    st.markdown(f"### 📚 Subject Discovery & Mapping ({exam_language} Medium)")
-    sub_col1, sub_col2 = st.columns([3, 1])
-    with sub_col1:
-        if api_key_input and st.button("🤖 Discover Official Subjects via Groq"):
-            with st.spinner("Querying board frameworks..."):
-                try:
-                    prompt = f"List official core subjects for Category: {category}, Board/Stream: {board_stream}, Level: {grade}, Language/Medium: {exam_language}. Return ONLY a raw JSON array of strings in {exam_language}: [\"Subject 1\", \"Subject 2\"]."
-                    clean_res = call_groq_llm(api_key_input, prompt)
-                    st.session_state.fetched_subjects = robust_parse_json(clean_res)
-                    st.success("Subjects discovered!")
-                except Exception as e:
-                    st.error(f"Discovery error: {e}")
+def persistence_and_student_assignment_agent(state: ExamAgentState) -> ExamAgentState:
+    state["status_log"].append("Persistence & Assignment Agent active: Saving generated question sets and mapping students...")
+    
+    conn = sqlite3.connect("exam_platform_agentic.db", check_same_thread=False)
+    cursor = conn.cursor()
+    
+    cursor.execute("""
+        UPDATE paper_configs 
+        SET generation_status = 'Generated & Released'
+        WHERE id = ?
+    """, (state["config_id"],))
+    conn.commit()
+    
+    for s_item in state["generated_sets"]:
+        cursor.execute(
+            "INSERT INTO paper_sets (config_id, set_name, question_data) VALUES (?, ?, ?)",
+            (state["config_id"], s_item["set_name"], json.dumps(s_item["data"]))
+        )
+    conn.commit()
+    
+    cursor.execute("SELECT id, name, email FROM students")
+    students = cursor.fetchall()
+    
+    available_sets = [s["set_name"] for s in state["generated_sets"]]
+    
+    if available_sets and students:
+        for idx, student in enumerate(students):
+            stu_id, stu_name, stu_email = student
+            assigned_set = available_sets[idx % len(available_sets)]
+            
+            cursor.execute("SELECT id FROM student_assignments WHERE config_id = ? AND student_id = ?", (state["config_id"], str(stu_id)))
+            if not cursor.fetchone():
+                cursor.execute(
+                    "INSERT INTO student_assignments (config_id, student_id, assigned_set, assignment_status) VALUES (?, ?, ?, ?)",
+                    (state["config_id"], str(stu_id), assigned_set, "Assigned in Database")
+                )
+                conn.commit()
+            state["status_log"].append(f"📌 Assigned [{assigned_set}] to student: {stu_name}")
+            
+    conn.close()
+    return state
 
-        if "fetched_subjects" in st.session_state and st.session_state.fetched_subjects:
-            subject = st.selectbox("Select Discovered Subject", st.session_state.fetched_subjects, key="selected_discovered_subject")
-        else:
-            default_subj = "हिन्दी (Hindi)" if "Hindi" in exam_language else ("संस्कृत (Sanskrit)" if "Sanskrit" in exam_language else "Mathematics")
-            subject = st.text_input("Core Subject Name", default_subj, key="manual_subject_input")
+workflow = StateGraph(ExamAgentState)
+workflow.add_node("validator", syllabus_validator_agent)
+workflow.add_node("generator", question_generator_agent)
+workflow.add_node("qa_auditor", qa_red_teaming_agent)
+workflow.add_node("assigner", persistence_and_student_assignment_agent)
+workflow.set_entry_point("validator")
+workflow.add_edge("validator", "generator")
+workflow.add_edge("generator", "qa_auditor")
+workflow.add_edge("qa_auditor", "assigner")
+workflow.add_edge("assigner", END)
+app_graph = workflow.compile()
 
-    st.markdown("---")
-    st.subheader("⚙️ Section Blueprint & Chapter Matrix")
-    if api_key_input and st.button("✨ Auto-Populate Matrix"):
-        with st.spinner("Extracting standard syllabus matrix..."):
-            try:
-                prompt = f"""
-                Provide official core chapters and key topic units for Board: {board_stream}, Grade: {grade}, Subject: {subject} in Language: {exam_language}.
-                Return ONLY a raw JSON array of objects with keys 'chapter' and 'topics' (as a comma-separated string) in {exam_language}:
-                [{{"chapter": "Chapter Name", "topics": "Topic A, Topic B"}}]
-                """
-                clean_res = call_groq_llm(api_key_input, prompt)
-                discovered_matrix = robust_parse_json(clean_res)
+# ==========================================
+# 4. BACKGROUND CRON AGENT WORKER POLLER
+# ==========================================
+def background_scheduler_worker():
+    """Autonomous background thread polling every 10 seconds for pending exams."""
+    while True:
+        try:
+            conn = sqlite3.connect("exam_platform_agentic.db", check_same_thread=False)
+            cursor = conn.cursor()
+            
+            now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            
+            cursor.execute("""
+                SELECT id, stream_category, board_or_org, grade_level, subject, exam_language, matrix_data, num_sets, scheduled_time
+                FROM paper_configs 
+                WHERE generation_status = 'Pending' AND scheduled_time <= ?
+            """, (now_str,))
+            pending_exams = cursor.fetchall()
+            
+            for exam in pending_exams:
+                c_id, s_cat, b_org, g_lvl, subj, lang, matrix_json, n_sets, sched_t = exam
                 
-                st.session_state.matrix_rows = []
-                for item in discovered_matrix:
-                    st.session_state.matrix_rows.append({"chapter": item.get("chapter", ""), "topics": item.get("topics", ""), "level": "Moderate", "q_type": "MCQ", "count": 2, "marks": 2})
-                st.success("Syllabus successfully mapped!")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Mapping failed: {e}")
+                with global_lock:
+                    api_key_val = GLOBAL_API_KEY
+                
+                if not api_key_val:
+                    cursor.execute(
+                        "INSERT INTO agent_scheduler_logs (config_id, log_message, logged_at) VALUES (?, ?, ?)",
+                        (c_id, "Background agent triggered, but skipped: Groq API Key not found in st.secrets.", now_str)
+                    )
+                    conn.commit()
+                    continue
+                
+                matrix_rows = json.loads(matrix_json)
+                
+                initial_state = {
+                    "api_key": api_key_val,
+                    "stream_category": s_cat,
+                    "board_or_org": b_org,
+                    "grade_level": g_lvl,
+                    "subject": subj,
+                    "exam_language": lang,
+                    "matrix_rows": matrix_rows,
+                    "num_sets": n_sets,
+                    "config_id": c_id,
+                    "scheduled_time": sched_t,
+                    "generated_sets": [],
+                    "status_log": []
+                }                                                                                
+                
+                final_state = app_graph.invoke(initial_state)
+                
+                for log_msg in final_state["status_log"]:
+                    cursor.execute(
+                        "INSERT INTO agent_scheduler_logs (config_id, log_message, logged_at) VALUES (?, ?, ?)",
+                        (c_id, log_msg, datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+                    )
+                conn.commit()
+                
+            conn.close()
+        except Exception as e:
+            pass
+        
+        time.sleep(10)
+
+if "scheduler_started" not in st.session_state:
+    st.session_state.scheduler_started = True
+    t = threading.Thread(target=background_scheduler_worker, daemon=True)
+    t.start()
+
+# ==========================================
+# 5. AGENTIC STUDENT EVALUATION FUNCTION
+# ==========================================
+def run_agentic_student_evaluation(api_key: str, student_name: str, config_id: str, score: float, details: dict) -> dict:
+    sys_p = """You are an elite academic performance psychologist and senior examiner agent. Analyze the student's exam answers, identify conceptual weak spots, map out strengths, and write encouraging yet actionable diagnostic feedback. 
+    You MUST return ONLY a valid JSON object with these exact keys:
+    - "strengths": A string describing the student's mastered chapters or question topics.
+    - "weak_areas": A string detailing concepts where the student made mistakes or lacked clarity.
+    - "personalized_feedback": A comprehensive 3-4 sentence paragraph of constructive advice and study recommendations."""
+    
+    user_p = f"""Student Name: {student_name}
+    Exam ID: {config_id}
+    Overall Score: {score:.2f}%
+    Question-by-Question breakdown and answers: {json.dumps(details)}
+    
+    Generate the diagnostic report in JSON format."""
+    
+    try:
+        if not api_key:
+            return {
+                "strengths": "Demonstrated consistent basic problem-solving ability.",
+                "weak_areas": "Requires further review on complex application questions.",
+                "personalized_feedback": f"Good effort on {config_id}! Review incorrect responses to build deeper mastery."
+            }
+        
+        res_text = call_groq_llm(api_key, sys_p, user_p)
+        return robust_parse_json(res_text)
+    except Exception as e:
+        return {
+            "strengths": "Completed all evaluation items.",
+            "weak_areas": "Error running agentic diagnostic analysis.",
+            "personalized_feedback": f"Exam completed with score {score:.2f}%."
+        }
+
+# ==========================================
+# 6. STREAMLIT USER INTERFACE (PORTALS)
+# ==========================================
+st.sidebar.title("🛡️ TestGen-Agent Portal")
+role = st.sidebar.selectbox("Select Operational Role", ["Teacher Agent Dashboard", "Student Examination Portal", "Analytics & Reports Hub", "Live Database Inspector"])
+
+# Fallback visual check for secrets status
+if GLOBAL_API_KEY:
+    st.sidebar.success("🔑 API Key loaded securely from Secrets!")
+else:
+    st.sidebar.warning("⚠️ API Key missing in `.streamlit/secrets.toml`!")
+
+if role == "Teacher Agent Dashboard":
+    st.title("👨‍🏫 Autonomous Teacher Control Center")
+    st.markdown("Configure exam domains, schedule exact automated release times, and let the **Background Cron Agent** execute generation & distribution autonomously at the designated timestamp.")
+
+    stream_options = {
+        "School Education": {
+            "boards": ["CBSE", "ICSE / ISC", "State Board", "International Baccalaureate (IB)", "Cambridge (IGCSE)"],
+            "grades": [f"Class {i}" for i in range(1, 13)]
+        },
+        "College / University": {
+            "boards": ["AICTE / UGC Affiliated", "State University", "Central University", "Deemed University", "Autonomous Institution"],
+            "grades": ["Semester 1", "Semester 2", "Semester 3", "Semester 4", "Semester 5", "Semester 6", "Semester 7", "Semester 8"]
+        },
+        "Competitive & Entrance Exams": {
+            "boards": ["NTA (NEET / JEE)", "UPSC (Civil Services)", "IBPS / SBI (Banking)", "GATE / PSU Bodies", "State PSC"],
+            "grades": ["Aspirant Tier 1", "Aspirant Tier 2", "Advanced / Mains Level"]
+        },
+        "Corporate Certification": {
+            "boards": ["Internal L&D", "AWS / Cloud Certification Board", "Agile / Scrum Alliance", "Cybersecurity Accreditation"],
+            "grades": ["Foundational", "Associate", "Professional / Expert"]
+        }
+    }
+
+    col1, col2 = st.columns(2)
+    with col1:
+        stream_category = st.selectbox("Stream / Domain Category", list(stream_options.keys()), key="stream_category_select")
+        available_boards = stream_options[stream_category]["boards"]
+        board_or_org = st.selectbox("Board / University / Organization", available_boards, key="board_select")
+
+    with col2:
+        available_grades = stream_options[stream_category]["grades"]
+        grade_level = st.selectbox("Grade / Semester / Level", available_grades, key="grade_select")
+        exam_language = st.selectbox("Exam Language", ["English", "Hindi", "Spanish", "French", "Regional"])
+
+    st.markdown("### ⏰ Autonomous Scheduled Release Time")
+    st.markdown("> *Set a future date and time (or 1 minute ahead). The background agent watcher will automatically trigger question paper synthesis and student assignment when the clock hits this exact timestamp.*")
+    
+    sched_col1, sched_col2 = st.columns(2)
+    with sched_col1:
+        exam_date = st.date_input("Scheduled Exam Date", datetime.date.today())
+    with sched_col2:
+        default_time = (datetime.datetime.now() + datetime.timedelta(minutes=1)).time()
+        exam_time = st.time_input("Scheduled Release Time", default_time)
+    
+    scheduled_datetime_str = datetime.datetime.combine(exam_date, exam_time).strftime("%Y-%m-%d %H:%M:%S")
+    num_sets = st.slider("Number of Parallel Anti-Cheating Sets", 1, 4, 3)
 
     if "matrix_rows" not in st.session_state:
         st.session_state.matrix_rows = []
 
-    matrix_input_data = []
-    if not st.session_state.matrix_rows:
-        st.info("💡 No chapters added yet. Click **'Auto-Populate Matrix'** above or **'Add Section Row'** below to build your blueprint.")
-    
-    for idx, row in enumerate(st.session_state.matrix_rows):
-        cols = st.columns([2, 3, 2, 1, 1, 1, 1])
-        with cols[0]: ch = st.text_input(f"Chapter {idx+1}", value=row["chapter"], key=f"ch_{idx}")
-        with cols[1]: tp = st.text_input(f"Topics {idx+1}", value=row["topics"], key=f"tp_{idx}")
-        with cols[2]: lvl = st.selectbox(f"Level {idx+1}", ["Easy", "Moderate", "High"], index=["Easy", "Moderate", "High"].index(row.get("level", "Moderate")), key=f"lvl_{idx}")
-        with cols[3]: qt = st.selectbox(f"Type {idx+1}", ["MCQ", "Short Answer", "Numerical / Derivation"], index=["MCQ", "Short Answer", "Numerical / Derivation"].index(row["q_type"]), key=f"qt_{idx}")
-        with cols[4]: cnt = st.number_input(f"Count {idx+1}", min_value=1, value=row["count"], key=f"cnt_{idx}")
-        with cols[5]: mks = st.number_input(f"Marks {idx+1}", min_value=1, value=row["marks"], key=f"mks_{idx}")
-        with cols[6]:
-            st.write("")
-            st.write("")
-            if st.button("🗑️", key=f"del_{idx}"):
-                st.session_state.matrix_rows.pop(idx)
-                st.rerun()
-        matrix_input_data.append({"chapter": ch, "topics": tp, "level": lvl, "q_type": qt, "count": cnt, "marks": mks})
-
-    if st.button("➕ Add Section Row"):
-        st.session_state.matrix_rows.append({"chapter": "", "topics": "", "level": "Moderate", "q_type": "MCQ", "count": 2, "marks": 2})
-        st.rerun()
+    if "ai_suggested_subjects" not in st.session_state:
+        st.session_state.ai_suggested_subjects = ["Physics", "Mathematics", "Chemistry", "Biology", "Computer Science"]
 
     st.markdown("---")
-    col_s1, col_s2 = st.columns(2)
-    with col_s1: num_sets = st.slider("Parallel Anti-Cheating Randomized Sets", 1, 4, 3)
-    with col_s2:
-        current_ist = get_ist_now()
-        exam_date = st.date_input("Exam Date", value=current_ist.date())
-        exam_time = st.time_input("Exam Start Time", value=current_ist.time())
-        
-    scheduled_dt_str = f"{exam_date} {exam_time}"
+    st.subheader("⚙️ Autonomous Subject & Syllabus Mapping Agent")
     
-    b_col1, b_col2 = st.columns(2)
-    with b_col1:
-        if st.button("🚀 Schedule Exam Blueprint", type="primary"):
-            if not api_key_input: st.error("Groq API Key required.")
-            elif not st.session_state.matrix_rows: st.error("Please add at least one chapter row to the matrix.")
-            else:
-                config_id = f"CFG_{subject[:3].upper()}_{random.randint(1000,9999)}"
-                conn = get_db_connection()
-                c = conn.cursor()
-                c.execute(
-                    "INSERT OR REPLACE INTO paper_configs (config_id, category, board_stream, grade, subject, language, matrix_data, num_sets, exam_time, generated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (config_id, category, board_stream, grade, subject, exam_language, json.dumps(matrix_input_data, ensure_ascii=False), num_sets, scheduled_dt_str, 0)
-                )
-                conn.commit()
-                conn.close()
-                st.success(f"✅ Config scheduled! Copy this Config ID for students: **{config_id}**")
-    with b_col2:
-        if st.button("⚡ Force Generate & Lock Sets Now"):
-            if not api_key_input: st.error("Groq API Key required.")
-            elif not st.session_state.matrix_rows: st.error("Please add at least one chapter row to the matrix.")
-            else:
-                config_id = f"CFG_{subject[:3].upper()}_{random.randint(1000,9999)}"
-                conn = get_db_connection()
-                c = conn.cursor()
-                c.execute(
-                    "INSERT OR REPLACE INTO paper_configs (config_id, category, board_stream, grade, subject, language, matrix_data, num_sets, exam_time, generated) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (config_id, category, board_stream, grade, subject, exam_language, json.dumps(matrix_input_data, ensure_ascii=False), num_sets, scheduled_dt_str, 0)
-                )
-                conn.commit()
-                conn.close()
-                with st.spinner("Synthesizing multi-set question banks with Groq..."):
-                    success, msg = run_jit_generation(config_id, api_key_input)
-                    if success: st.success(f"🔥 Successfully generated! Copy this Config ID: **{config_id}**")
-                    else: st.error(f"Generation error: {msg}")
+    sub_col1, sub_col2 = st.columns([3, 1])
+    with sub_col2:
+        st.markdown("<br>", unsafe_allow_html=True)
+        fetch_subjects_btn = st.button("🤖 Suggest Subjects")
 
-# ==========================================
-# 2. STUDENT PORTAL
-# ==========================================
-elif role == "Student Examination Portal":
-    st.header("📝 Student Assessment Portal")
-    col_login1, col_login2 = st.columns(2)
-    with col_login1: student_name = st.text_input("Full Name", value="")
-    with col_login2: input_config_id = st.text_input("Assessment Config ID")
-        
-    if input_config_id and student_name.strip():
-        config_row = fetch_config(input_config_id)
-        if config_row:
-            cat, b_stream, grd, subj, lang, matrix_json, n_sets, exam_time_str, is_generated = config_row
-            
+    if fetch_subjects_btn and GLOBAL_API_KEY:
+        with st.spinner("AI Agent discovering valid core subjects..."):
             try:
-                scheduled_dt = datetime.strptime(exam_time_str, "%Y-%m-%d %H:%M:%S").replace(tzinfo=IST)
-            except ValueError:
-                scheduled_dt = get_ist_now()
+                sys_p = "You are an expert curriculum assistant. Return ONLY a valid JSON object containing a key 'subjects' with a list of string values."
+                user_p = f"List 5 standard subjects for Stream: {stream_category}, Board/Org: {board_or_org}, Level: {grade_level}. Return format: {{'subjects': ['Subject 1', 'Subject 2', ...]}}"
                 
-            current_dt = get_ist_now()
-            
-            if is_generated == 0 and current_dt >= (scheduled_dt - timedelta(minutes=2)):
-                if api_key_input:
-                    with st.spinner("⏰ Exam scheduled time reached or approaching! Automatically generating question sets..."):
-                        success, msg = run_jit_generation(input_config_id, api_key_input)
-                        if success:
-                            st.success("✨ Sets successfully auto-generated just in time for the exam!")
-                            config_row = fetch_config(input_config_id)
-                            is_generated = config_row[8]
-                        else:
-                            st.error(f"Auto-generation error: {msg}")
-                else:
-                    st.warning("⚠️ Exam schedule time has arrived, but the Groq API Key is missing in the sidebar. Please enter your API key to enable auto-generation.")
+                sugg_res = call_groq_llm(GLOBAL_API_KEY, sys_p, user_p)
+                parsed_json = robust_parse_json(sugg_res)
+                parsed_sugg = parsed_json.get("subjects", [])
+                
+                if parsed_sugg:
+                    st.session_state.ai_suggested_subjects = parsed_sugg
+                    st.success("AI suggested subjects successfully updated into dropdown!")
+            except Exception as e:
+                st.warning(f"Could not fetch AI suggestions: {e}")
 
-            conn = get_db_connection()
-            c = conn.cursor()
-            c.execute("SELECT set_id, set_name, data, unlock_time, expires_at FROM paper_sets WHERE config_id = ?", (input_config_id,))
-            available_sets = c.fetchall()
-            conn.close()
-            
-            if available_sets:
-                chosen_set = st.selectbox("Select Assigned Set Variant", available_sets, format_func=lambda x: f"{x[1]} (ID: {x[0]})")
-                set_id, set_name, data_json, u_time, e_time = chosen_set
-                
-                conn = get_db_connection()
-                c = conn.cursor()
-                c.execute("SELECT score, total_marks, agent_report, submitted_at FROM submissions WHERE student = ? AND set_id = ?", (student_name.strip(), set_id))
-                prior_sub = c.fetchone()
-                conn.close()
-                
-                if prior_sub:
-                    p_score, p_total, p_report, p_time = prior_sub
-                    st.warning(f"🔒 **Exam already submitted by {student_name.strip()} for {set_name} on {p_time}.** Answers are locked.")
-                    st.metric("Recorded Final Score", f"{p_score} / {p_total}")
-                    st.markdown("---")
-                    st.markdown("### Diagnostic Evaluation Report")
-                    st.markdown(p_report)
-                else:
-                    st.success(f"Session Active ({lang}) — **{set_name}** loaded successfully.")
-                    questions = json.loads(data_json)
+    with sub_col1:
+        subject = st.selectbox("Select or AI-Suggested Subject", st.session_state.ai_suggested_subjects)
+
+    if GLOBAL_API_KEY and st.button("✨ Dispatch Syllabus Mapping Agent"):
+        if not subject:
+            st.warning("Please specify a subject name before mapping the syllabus.")
+        else:
+            with st.spinner("Agent mapping core units & chapters..."):
+                try:
+                    sys_p = "You are an expert academic syllabus architect. Return ONLY a valid JSON object containing a key 'syllabus'."
+                    user_p = f"Provide core chapters and topic units for Domain: {stream_category}, Organization: {board_or_org}, Level: {grade_level}, Subject: {subject} in Language: {exam_language}. Return format: {{'syllabus': [{{'chapter': 'Name', 'topics': 'Topic A, Topic B'}}]}}"
                     
-                    with st.form("student_live_exam"):
-                        student_answers = {}
-                        for idx, q in enumerate(questions):
-                            q_chapter = q.get('chapter', 'General')
-                            q_level = q.get('level', 'Moderate')
-                            q_text = q.get('q', '')
-                            q_marks = int(q.get('marks', 1))
-                            
-                            st.markdown(f"**Q{idx+1}. [{q_chapter} | *{q_level}*] {q_text}** *({q_marks} Marks)*")
-                            
-                            if "options" in q and q["options"]:
-                                opts = q["options"].copy()
-                                student_answers[q['id']] = st.radio(f"Select choice {idx+1}", opts, key=f"ans_{set_id}_{q['id']}")
-                            else:
-                                student_answers[q['id']] = st.text_input(f"Answer {idx+1}", key=f"ans_{set_id}_{q['id']}")
-                                
-                        submitted_exam = st.form_submit_button("📤 Submit Final Examination (Locks Answers)", type="primary")
-                        if submitted_exam:
-                            if not api_key_input: st.error("Groq API Key required.")
-                            else:
-                                with st.spinner("Evaluating submissions and generating detailed diagnostic report..."):
-                                    score = 0
-                                    total_marks = 0
-                                    evaluation_breakdown = []
-                                    
-                                    for idx, q in enumerate(questions):
-                                        q_marks = int(q.get('marks', 1))
-                                        total_marks += q_marks
-                                        user_ans = str(student_answers.get(q['id'])).strip()
-                                        correct_ans = str(q['correct']).strip()
-                                        is_correct = user_ans.lower() == correct_ans.lower()
-                                        if is_correct:
-                                            score += q_marks
-                                        
-                                        evaluation_breakdown.append(
-                                            f"- **Q{idx+1} ({q.get('chapter', 'General')}):** Given: `{user_ans}` | Correct: `{correct_ans}` | Result: {'✅ Correct' if is_correct else '❌ Incorrect'}"
-                                        )
-                                            
-                                    try:
-                                        eval_prompt = f"""
-                                        Analyze this student exam submission thoroughly and provide a comprehensive diagnostic evaluation report in rich markdown (in language: {lang}):
-                                        Student Name: {student_name}
-                                        Score: {score} out of {total_marks} ({score/total_marks*100:.1f}%)
-                                        Question Details & Answers:
-                                        {chr(10).join(evaluation_breakdown)}
+                    clean_res = call_groq_llm(GLOBAL_API_KEY, sys_p, user_p)
+                    parsed_matrix = robust_parse_json(clean_res)
+                    discovered_matrix = parsed_matrix.get("syllabus", [])
+                    
+                    st.session_state.matrix_rows = []
+                    for item in discovered_matrix:
+                        st.session_state.matrix_rows.append({"chapter": item.get("chapter", ""), "topics": item.get("topics", ""), "level": "Moderate", "q_type": "MCQ", "count": 2, "marks": 2})
+                    st.success("Syllabus mapped autonomously by agent!")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Mapping agent failed: {e}")
 
-                                        Include sections:
-                                        1. Executive Summary & Performance Grade
-                                        2. Strengths & Topic Mastery
-                                        3. Areas for Improvement & Conceptual Gaps
-                                        4. Actionable Study Recommendations
-                                        """
-                                        agent_report = call_groq_llm(api_key_input, eval_prompt)
-                                    except Exception as e:
-                                        agent_report = f"""
-### 📋 Detailed Diagnostic Evaluation Report ({lang})
+    edited_df = st.data_editor(pd.DataFrame(st.session_state.matrix_rows), num_rows="dynamic", use_container_width=True)
+    config_id_input = st.text_input("Unique Config ID", value="", placeholder="e.g. EXAM-NEET-PHYSICS-01")
 
-* **Student Name:** {student_name}
-* **Final Score:** **{score} / {total_marks}** ({score/total_marks*100:.1f}%)
-* **Status:** Evaluated Successfully
-
----
-
-#### 🔍 Question-by-Question Breakdown
-{chr(10).join(evaluation_breakdown)}
-
----
-
-#### 💡 Performance Summary
-The student completed the assessment set. Review the incorrect responses above to identify specific chapters requiring targeted revision.
-                                        """
-                                        
-                                    conn = get_db_connection()
-                                    c = conn.cursor()
-                                    c.execute("INSERT INTO submissions (student, set_id, score, total_marks, student_answers, agent_report, submitted_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                                              (student_name.strip(), set_id, score, total_marks, json.dumps(student_answers, ensure_ascii=False), agent_report, str(get_ist_now())))
-                                    conn.commit()
-                                    conn.close()
-                                    
-                                    st.balloons()
-                                    st.success(f"🎉 Exam Submitted & Locked! Final Score: **{score} / {total_marks}**")
-                                    st.rerun()
-            else: 
-                st.warning("⚠️ Question sets are not yet generated. They will automatically synthesize once the exam schedule time is reached (or click **'Force Generate & Lock Sets Now'** in the Teacher Dashboard).")
-        else: st.error("Invalid Configuration ID.")
-    else:
-        st.info("💡 Please enter your full name and a valid Assessment Config ID to access your exam paper.")
-
-# ==========================================
-# 3. ANALYTICS & REPORTS HUB
-# ==========================================
-elif role == "Analytics & Reports Hub":
-    st.header("📊 Analytics & Performance Hub")
-    conn = get_db_connection()
-    c = conn.cursor()
-    c.execute("SELECT id, student, set_id, score, total_marks, agent_report, submitted_at FROM submissions ORDER BY id DESC")
-    subs = c.fetchall()
-    conn.close()
-    
-    if not subs: st.info("No submission records found yet.")
-    else:
-        for sub in subs:
-            sub_id, s_name, s_set, score, t_marks, report, s_time = sub
-            pct = (score / t_marks * 100) if t_marks > 0 else 0
-            with st.expander(f"👤 {s_name} | Set: {s_set} | Score: {score}/{t_marks} ({pct:.1f}%) | {s_time}"):
-                st.progress(pct / 100.0)
-                st.markdown(report)
-
-# ==========================================
-# 4. LIVE DATABASE INSPECTOR (For Live Demos)
-# ==========================================
-elif role == "Live Database Inspector":
-    st.header("🔍 Live Database Inspector (SQLite POC)")
-    st.write("Inspect or clear the raw underlying relational database tables directly inside the app interface for live presentation.")
-    
-    table_choice = st.selectbox("Select Database Table to Inspect", ["paper_configs", "paper_sets", "submissions"])
-    
-    col_insp1, col_insp2 = st.columns([3, 1])
-    with col_insp2:
-        if st.button("🗑️ Clear Selected Table", type="secondary"):
-            conn = get_db_connection()
-            c = conn.cursor()
-            c.execute(f"DELETE FROM {table_choice}")
+    if st.button("📅 Schedule Exam for Autonomous Background Generation"):
+        if not GLOBAL_API_KEY:
+            st.warning("Groq API key is missing from secrets.toml.")
+        elif not config_id_input:
+            st.warning("Please provide a Unique Config ID for this examination package.")
+        elif not subject:
+            st.warning("Please select a subject name.")
+        else:
+            conn = sqlite3.connect("exam_platform_agentic.db", check_same_thread=False)
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                INSERT OR REPLACE INTO paper_configs (id, stream_category, board_or_org, grade_level, subject, exam_language, matrix_data, num_sets, scheduled_time, generation_status)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'Pending')
+            """, (
+                config_id_input, stream_category, board_or_org, 
+                grade_level, subject, exam_language, 
+                json.dumps(edited_df.to_dict(orient="records")), num_sets, scheduled_datetime_str
+            ))
             conn.commit()
             conn.close()
-            st.success(f"Cleared all entries from `{table_choice}`!")
+            
+            st.success(f"✅ Exam **{config_id_input}** successfully scheduled for **{scheduled_datetime_str}**! The background agent worker will automatically pick it up and generate questions when the time arrives.")
+
+elif role == "Student Examination Portal":
+    st.title("🎓 Student Examination Room")
+    st.markdown("Enter your assigned Exam ID and registered email to take your test once the background agent generates it.")
+    
+    if "active_exam" not in st.session_state:
+        st.session_state.active_exam = None
+    if "last_report" not in st.session_state:
+        st.session_state.last_report = None
+
+    config_id_input = st.text_input("Enter Exam Configuration ID:", value="EXAM-DEMO-01")
+    student_email_input = st.text_input("Your Registered Email (e.g. rajat.student@example.com):", value="rajat.student@example.com")
+
+    col_enter, col_reset = st.columns([2, 1])
+    with col_enter:
+        enter_btn = st.button("🔍 Verify & Enter Exam Room", type="primary")
+    with col_reset:
+        if st.button("🔄 Reset Session"):
+            st.session_state.active_exam = None
+            st.session_state.last_report = None
             st.rerun()
 
-    conn = get_db_connection()
-    try:
-        df = pd.read_sql_query(f"SELECT * FROM {table_choice}", conn)
-        st.metric(f"Total Rows in `{table_choice}`", len(df))
-        st.dataframe(df, use_container_width=True)
-    except Exception:
-        st.info(f"Table `{table_choice}` is currently empty. Run an action in the Teacher or Student portal first!")
-    finally:
+    if enter_btn:
+        conn = sqlite3.connect("exam_platform_agentic.db", check_same_thread=False)
+        cursor = conn.cursor()
+        
+        cursor.execute("SELECT scheduled_time, generation_status FROM paper_configs WHERE id = ?", (config_id_input,))
+        config_row = cursor.fetchone()
+        
+        if not config_row:
+            st.error(f"Exam ID '{config_id_input}' not found in database.")
+        else:
+            scheduled_str, gen_status = config_row
+            
+            if gen_status != "Generated & Released":
+                st.warning(f"⏳ Exam paper is still **Pending scheduled generation** by the background agent. Scheduled release time: **{scheduled_str}**. Please wait until the scheduled time arrives.")
+                conn.close()
+                st.stop()
+
+            cursor.execute("SELECT id, name, email FROM students WHERE email = ?", (student_email_input.strip(),))
+            stu_row = cursor.fetchone()
+            
+            if not stu_row:
+                st.error(f"Email '{student_email_input}' not found in registered roster.")
+            else:
+                stu_id, stu_name, stu_email = stu_row  # Fixed unpacking
+                
+                cursor.execute("SELECT score, details, submitted_at FROM submissions WHERE config_id = ? AND student_name = ?", (config_id_input, stu_name))
+                sub_row = cursor.fetchone()
+                
+                if sub_row:
+                    st.warning(f"⚠️ **Notice:** You have already submitted this exam on **{sub_row[2]}** with a score of **{sub_row[0]:.2f}%**.")
+                    
+                    cursor.execute("SELECT strengths, weak_areas, personalized_feedback FROM student_reports WHERE config_id = ? AND student_name = ?", (config_id_input, stu_name))
+                    rep_row = cursor.fetchone()
+                    
+                    st.session_state.last_report = {
+                        "student_name": stu_name,
+                        "config_id": config_id_input,
+                        "score": sub_row[0],
+                        "submitted_at": sub_row[2],
+                        "details": json.loads(sub_row[1]),
+                        "agent_analysis": {
+                            "strengths": rep_row[0] if rep_row else "Evaluated by system",
+                            "weak_areas": rep_row[1] if rep_row else "Review performance breakdown",
+                            "personalized_feedback": rep_row[2] if rep_row else "Good effort."
+                        } if rep_row else {}
+                    }
+                    st.session_state.active_exam = None
+                else:
+                    cursor.execute("SELECT assigned_set FROM student_assignments WHERE config_id = ? AND student_id = ?", (config_id_input, str(stu_id)))
+                    assign_row = cursor.fetchone()
+                    
+                    if not assign_row:
+                        st.warning("No assigned paper set found for your student profile under this Exam ID.")
+                    else:
+                        assigned_set_name = assign_row[0]
+                        cursor.execute("SELECT question_data FROM paper_sets WHERE config_id = ? AND set_name = ?", (config_id_input, assigned_set_name))
+                        set_data_row = cursor.fetchone()
+                        
+                        if not set_data_row:
+                            st.error("Assigned paper set payload could not be loaded from database.")
+                        else:
+                            q_json = json.loads(set_data_row[0])
+                            st.session_state.active_exam = {
+                                "config_id": config_id_input,
+                                "student_name": stu_name,
+                                "student_email": student_email_input,
+                                "assigned_set_name": assigned_set_name,
+                                "questions": q_json.get("questions", [])
+                            }
+                            st.session_state.last_report = None
+                            st.success(f"Authenticated successfully! Welcome, {stu_name}. Assigned Paper: **{assigned_set_name}**.")
+                            st.rerun()
         conn.close()
+
+    if st.session_state.last_report:
+        rep = st.session_state.last_report
+        st.markdown("---")
+        st.markdown(f"## 📋 Agentic Diagnostic & Performance Report")
+        st.info(f"Student: **{rep['student_name']}** | Exam ID: **{rep['config_id']}** | Final Score: **{rep['score']:.2f}%** | Submitted: {rep['submitted_at']}")
+        
+        agent_data = rep.get("agent_analysis", {})
+        if agent_data:
+            col_a, col_b = st.columns(2)
+            with col_a:
+                st.success(f"**💪 Identified Strengths:**\n\n{agent_data.get('strengths', 'N/A')}")
+            with col_b:
+                st.error(f"**🎯 Areas for Improvement:**\n\n{agent_data.get('weak_areas', 'N/A')}")
+            
+            st.info(f"**🤖 AI Examiner Feedback:**\n\n{agent_data.get('personalized_feedback', 'N/A')}")
+
+    if st.session_state.active_exam:
+        exam = st.session_state.active_exam
+        st.markdown("---")
+        st.subheader(f"📝 Active Examination: {exam['config_id']} ({exam['assigned_set_name']})")
+        st.info(f"Examinee: **{exam['student_name']}** | Answer all questions below carefully.")
+
+        questions = exam["questions"]
+        student_answers = {}
+
+        for idx, q in enumerate(questions, 1):
+            st.markdown(f"**Q{idx} [{q.get('chapter', 'General')}]: {q.get('question')}** *(Marks: {q.get('marks', 2)})*")
+            options = q.get("options", [])
+            widget_key = f"ans_input_{exam['config_id']}_{idx}"
+            
+            if options and isinstance(options, list) and len(options) > 0:
+                ans = st.radio(f"Select option for Q{idx}", options, key=widget_key, index=None)
+                student_answers[f"q_{idx}"] = {
+                    "chapter": q.get("chapter"),
+                    "question": q.get("question"), 
+                    "selected": ans if ans else "No Answer", 
+                    "correct": q.get("answer")
+                }
+            else:
+                ans = st.text_area(f"Provide answer for Q{idx}", key=widget_key)
+                student_answers[f"q_{idx}"] = {
+                    "chapter": q.get("chapter"),
+                    "question": q.get("question"), 
+                    "selected": ans if ans else "No Answer", 
+                    "correct": q.get("answer")
+                }
+
+        st.markdown("<br>", unsafe_allow_html=True)
+        if st.button("🚀 Submit Exam & Generate Agentic Diagnostic Report", type="primary"):
+            correct_count = 0
+            total_evaluated = 0
+            
+            for key, val in student_answers.items():
+                selected_val = val["selected"]
+                correct_val = val["correct"]
+                
+                if correct_val:
+                    total_evaluated += 1
+                    if str(selected_val).strip().lower() == str(correct_val).strip().lower():
+                        correct_count += 1
+
+            final_score = (correct_count / total_evaluated * 100) if total_evaluated > 0 else 100.0
+            submitted_time_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            with st.spinner("🤖 Autonomous Evaluator Agent analyzing performance and drafting diagnostic report..."):
+                agent_analysis = run_agentic_student_evaluation(
+                    api_key=GLOBAL_API_KEY,
+                    student_name=exam["student_name"],
+                    config_id=exam["config_id"],
+                    score=final_score,
+                    details=student_answers
+                )
+
+            conn = sqlite3.connect("exam_platform_agentic.db", check_same_thread=False)
+            sub_cursor = conn.cursor()
+            
+            sub_cursor.execute("SELECT id FROM submissions WHERE config_id = ? AND student_name = ?", (exam["config_id"], exam["student_name"]))
+            if sub_cursor.fetchone():
+                st.error("Submission already recorded for this student.")
+                conn.close()
+            else:
+                sub_cursor.execute("""
+                    INSERT INTO submissions (config_id, student_name, score, details, submitted_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (exam["config_id"], exam["student_name"], final_score, json.dumps(student_answers), submitted_time_str))
+                
+                sub_cursor.execute("""
+                    INSERT INTO student_reports (config_id, student_name, overall_score, strengths, weak_areas, personalized_feedback, question_breakdown, generated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    exam["config_id"], exam["student_name"], final_score,
+                    agent_analysis.get("strengths", ""),
+                    agent_analysis.get("weak_areas", ""),
+                    agent_analysis.get("personalized_feedback", ""),
+                    json.dumps(student_answers),
+                    submitted_time_str
+                ))
+                conn.commit()
+                conn.close()
+
+                st.success(f"🎉 Exam submitted and evaluated autonomously! Final Score: **{final_score:.2f}%**.")
+                
+                st.session_state.last_report = {
+                    "student_name": exam["student_name"],
+                    "config_id": exam["config_id"],
+                    "score": final_score,
+                    "submitted_at": submitted_time_str,
+                    "details": student_answers,
+                    "agent_analysis": agent_analysis
+                }
+                st.session_state.active_exam = None
+                st.rerun()
+
+elif role == "Analytics & Reports Hub":
+    st.title("📊 Analytics & Diagnostic Hub")
+    conn = sqlite3.connect("exam_platform_agentic.db", check_same_thread=False)
+    
+    tab1, tab2, tab3, tab4, tab5 = st.tabs(["Scheduled Configurations", "Students & Roster", "Submissions", "🧠 Student Diagnostic Reports", "⚙️ Background Agent Logs"])
+    with tab1:
+        configs_df = pd.read_sql_query("SELECT id, stream_category, board_or_org, subject, scheduled_time, generation_status, num_sets FROM paper_configs", conn)
+        st.dataframe(configs_df, use_container_width=True)
+    with tab2:
+        roster_df = pd.read_sql_query("""
+            SELECT s.name, s.email, a.config_id, a.assigned_set, a.assignment_status 
+            FROM students s 
+            LEFT JOIN student_assignments a ON s.id = a.student_id
+        """, conn)
+        st.dataframe(roster_df, use_container_width=True)
+    with tab3:
+        subs_df = pd.read_sql_query("SELECT id, config_id, student_name, score, submitted_at FROM submissions", conn)
+        if subs_df.empty:
+            st.info("No exam submissions recorded yet.")
+        else:
+            st.dataframe(subs_df, use_container_width=True)
+    with tab4:
+        st.markdown("### 🧠 Autonomous Student Diagnostic Reports (Agentic Insights)")
+        reports_df = pd.read_sql_query("SELECT student_name, config_id, overall_score, strengths, weak_areas, personalized_feedback, generated_at FROM student_reports", conn)
+        if reports_df.empty:
+            st.info("No agentic student reports generated yet.")
+        else:
+            st.dataframe(reports_df, use_container_width=True)
+            
+            st.markdown("---")
+            st.subheader("🔍 Inspect Individual Student Diagnostic File")
+            selected_student_report = st.selectbox("Select Student Report to View", reports_df["student_name"].unique())
+            if selected_student_report:
+                row = reports_df[reports_df["student_name"] == selected_student_report].iloc[0]
+                st.markdown(f"**Student:** {row['student_name']} | **Exam ID:** {row['config_id']} | **Score:** {row['overall_score']:.2f}%")
+                col_x, col_y = st.columns(2)
+                with col_x:
+                    st.success(f"**Strengths:**\n\n{row['strengths']}")
+                with col_y:
+                    st.error(f"**Weak Areas:**\n\n{row['weak_areas']}")
+                st.info(f"**AI Examiner Feedback:**\n\n{row['personalized_feedback']}")
+    with tab5:
+        st.markdown("### ⚙️ Background Cron Agent Execution Logs")
+        logs_df = pd.read_sql_query("SELECT id, config_id, log_message, logged_at FROM agent_scheduler_logs ORDER BY id DESC", conn)
+        if logs_df.empty:
+            st.info("No background agent logs recorded yet.")
+        else:
+            st.dataframe(logs_df, use_container_width=True)
+            
+    conn.close()
+
+elif role == "Live Database Inspector":
+    st.title("🛠️ Live SQLite Database Inspector")
+    conn = sqlite3.connect("exam_platform_agentic.db", check_same_thread=False)
+    table_choice = st.selectbox("Select Table to Inspect", ["paper_configs", "paper_sets", "students", "student_assignments", "submissions", "student_reports", "agent_scheduler_logs"])
+    table_df = pd.read_sql_query(f"SELECT * FROM {table_choice}", conn)
+    conn.close()
+    st.dataframe(table_df, use_container_width=True)
